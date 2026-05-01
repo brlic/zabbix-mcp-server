@@ -152,6 +152,16 @@ install_launchd() {
     <string>${LOG_DIR}/server.log</string>
     <key>StandardErrorPath</key>
     <string>${LOG_DIR}/server.log</string>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65535</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65535</integer>
+    </dict>
 </dict>
 </plist>
 PLIST
@@ -196,6 +206,7 @@ WorkingDirectory=${SCRIPT_DIR}
 ExecStart=${VENV}/bin/zabbix-mcp-server --config ${CONFIG_FILE}
 Restart=on-failure
 RestartSec=5
+LimitNOFILE=65535
 StandardOutput=append:${LOG_DIR}/server.log
 StandardError=append:${LOG_DIR}/server.log
 

@@ -102,6 +102,23 @@ The install script will:
 6. Set up logrotate for `/var/log/zabbix-mcp/*.log` (daily, 30 days retention)
 7. Verify file permissions and offer to fix any issues
 
+### User-mode install (no root, dev / laptop use)
+
+For developers running the server locally on their own machine, an alternative installer is shipped that does not require `sudo`:
+
+```bash
+./deploy/install-user.sh              # install
+./deploy/install-user.sh update       # git pull + pip + restart
+./deploy/install-user.sh uninstall
+```
+
+It detects Python 3.10+, creates a virtualenv inside the repo, copies `config.example.toml` to `config.toml` (with `log_file` rewritten to a user-writable path), and registers a background service:
+
+- **macOS** - LaunchAgent at `~/Library/LaunchAgents/com.initmax.zabbix-mcp-server.plist` (auto-restart via `KeepAlive`)
+- **Linux** - systemd `--user` unit at `~/.config/systemd/user/zabbix-mcp-server.service` with `loginctl enable-linger` so the service survives logout
+
+This is intended for local development. For production servers use the regular `sudo ./deploy/install.sh` above.
+
 ### Upgrade
 
 ```bash
