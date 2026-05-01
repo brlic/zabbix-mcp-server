@@ -86,6 +86,12 @@ class TokenInfo:
     expires_at: str | None = None  # ISO 8601
     is_legacy: bool = False
     revoked: bool = False
+    # Allow this token to call tools with raw_json=true, which strips the
+    # [System: ...] prompt-injection mitigation preamble from responses.
+    # Default off because the preamble is a defense-in-depth measure for
+    # LLM clients - operators must explicitly opt a token in for use by
+    # programmatic / non-LLM consumers (Python scripts, n8n workflows).
+    allow_raw_json: bool = False
     # Runtime stats (in-memory only, not persisted)
     last_used_at: str | None = None
     last_used_ip: str | None = None
@@ -167,6 +173,7 @@ class TokenStore:
                 expires_at=cfg.get("expires_at"),
                 is_legacy=cfg.get("is_legacy", False),
                 revoked=not cfg.get("is_active", True),
+                allow_raw_json=bool(cfg.get("allow_raw_json", False)),
             )
 
             # Preserve runtime stats from existing token

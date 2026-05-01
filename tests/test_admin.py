@@ -343,6 +343,75 @@ class TestTokenAuthorization(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# raw_json policy gate (server.py + token_store.py)
+# ---------------------------------------------------------------------------
+class TestRawJsonPolicy(unittest.TestCase):
+    """Tests for the token-scoped raw_json escape hatch.
+
+    The preamble (`[System: ...]`) is part of our prompt-injection
+    mitigation; raw_json=true strips it. The gate must default-deny
+    so an LLM cannot opt itself out of the mitigation.
+    """
+
+    def tearDown(self):
+        from zabbix_mcp.token_store import current_token_info
+        current_token_info.set(None)
+
+    def test_token_info_default_off(self):
+        from zabbix_mcp.token_store import TokenInfo
+        t = TokenInfo(id="t", name="T", token_hash="x")
+        self.assertFalse(t.allow_raw_json)
+
+    def test_load_from_config_parses_flag(self):
+        from zabbix_mcp.token_store import TokenStore
+        store = TokenStore()
+        store.load_from_config({
+            "default_off": {"name": "A", "token_hash": "sha256:aaa"},
+            "explicit_on": {"name": "B", "token_hash": "sha256:bbb", "allow_raw_json": True},
+            "explicit_off": {"name": "C", "token_hash": "sha256:ccc", "allow_raw_json": False},
+        })
+        self.assertFalse(store.get_token("default_off").allow_raw_json)
+        self.assertTrue(store.get_token("explicit_on").allow_raw_json)
+        self.assertFalse(store.get_token("explicit_off").allow_raw_json)
+
+    def test_check_allows_when_raw_json_false(self):
+        from zabbix_mcp.server import _check_raw_json_allowed
+        from zabbix_mcp.token_store import current_token_info, TokenInfo
+        # Even a token that lacks the policy passes when raw_json is not requested.
+        current_token_info.set(TokenInfo(id="t", name="T", token_hash="x", allow_raw_json=False))
+        self.assertIsNone(_check_raw_json_allowed(False))
+
+    def test_check_denies_token_without_policy(self):
+        from zabbix_mcp.server import _check_raw_json_allowed
+        from zabbix_mcp.token_store import current_token_info, TokenInfo
+        current_token_info.set(TokenInfo(id="t", name="alpha", token_hash="x", allow_raw_json=False))
+        result = _check_raw_json_allowed(True)
+        self.assertIsNotNone(result)
+        self.assertIn("alpha", result)
+        self.assertIn("allow raw json", result.lower())
+
+    def test_check_allows_token_with_policy(self):
+        from zabbix_mcp.server import _check_raw_json_allowed
+        from zabbix_mcp.token_store import current_token_info, TokenInfo
+        current_token_info.set(TokenInfo(id="t", name="T", token_hash="x", allow_raw_json=True))
+        self.assertIsNone(_check_raw_json_allowed(True))
+
+    def test_check_allows_when_no_token_context(self):
+        from zabbix_mcp.server import _check_raw_json_allowed
+        from zabbix_mcp.token_store import current_token_info
+        # stdio mode / pre-auth: no token to gate on, so do not block.
+        current_token_info.set(None)
+        self.assertIsNone(_check_raw_json_allowed(True))
+
+    def test_format_result_strips_preamble_when_true(self):
+        from zabbix_mcp.server import _format_result, _UNTRUSTED_PREAMBLE
+        out_with = _format_result("payload", False)
+        out_raw = _format_result("payload", True)
+        self.assertTrue(out_with.startswith(_UNTRUSTED_PREAMBLE))
+        self.assertEqual(out_raw, "payload")
+
+
+# ---------------------------------------------------------------------------
 # Config writer (config_writer.py)
 # ---------------------------------------------------------------------------
 class TestConfigWriter(unittest.TestCase):

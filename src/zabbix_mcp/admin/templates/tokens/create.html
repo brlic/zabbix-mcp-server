@@ -113,13 +113,34 @@
         <div class="form-group">
             <label class="toggle-label" tabindex="0" data-tooltip="When checked, this token cannot trigger any write operation (host_create, item_update, ...) regardless of its scopes. Recommended for read-mostly AI clients.">
                 <span class="toggle">
-                    <input type="checkbox" name="read_only" value="1">
+                    <input type="checkbox" name="read_only" value="1" {% if form_read_only %}checked{% endif %}>
                     <span class="toggle-slider"></span>
                 </span>
                 Read-only mode <span class="tooltip-icon">&#x1F6C8;</span>
             </label>
             <div class="form-hint">When enabled, the token can only read data, not make changes.</div>
         </div>
+
+        <div class="form-group">
+            <label class="toggle-label" tabindex="0" data-tooltip="Lets this token call any tool with raw_json=true, which strips the [System: ...] prompt-injection mitigation preamble from responses. UNSAFE for LLM clients (Claude, GPT, Cursor, ...) - they could ingest prompt-injection payloads embedded in Zabbix data such as host names, item descriptions, or problem text. Only enable for programmatic non-LLM consumers (Python scripts, n8n workflows that json.loads the response). Default: off.">
+                <span class="toggle">
+                    <input type="checkbox" id="allow_raw_json" name="allow_raw_json" value="1" {% if form_allow_raw_json %}checked{% endif %} onchange="toggleRawJsonWarning(this)">
+                    <span class="toggle-slider"></span>
+                </span>
+                Allow raw JSON (no security disclaimer) <span class="tooltip-icon">&#x1F6C8;</span>
+            </label>
+            <div class="form-hint">Off by default. Only enable for non-LLM clients that need pure JSON for programmatic parsing - it disables the prompt-injection mitigation marker on tool responses.</div>
+            <div id="raw-json-warning" class="alert alert-warning" style="margin-top:8px; {% if not form_allow_raw_json %}display:none;{% endif %}">
+                <strong>&#x26A0; Warning:</strong> this token will be allowed to bypass the prompt-injection mitigation preamble on tool responses. Use only with non-LLM clients (Python scripts, n8n, ...). Do not hand this token to Claude, GPT, Cursor, or any other LLM-driven client.
+            </div>
+        </div>
+
+        <script>
+        function toggleRawJsonWarning(cb) {
+            var w = document.getElementById('raw-json-warning');
+            if (w) { w.style.display = cb.checked ? '' : 'none'; }
+        }
+        </script>
 
         <div class="form-group">
             <label class="form-label" for="ip_allowlist">Token IP Restriction <span class="tooltip-icon" tabindex="0" data-tooltip="One IPv4/IPv6 address or CIDR range per line. Empty = any client IP. Layered AFTER the global server-level allowlist - this can only narrow, never widen.">&#x1F6C8;</span></label>

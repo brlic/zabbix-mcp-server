@@ -84,6 +84,26 @@
             </div>
 
             <div class="form-group">
+                <label class="toggle-label" tabindex="0" data-tooltip="Lets this token call any tool with raw_json=true, which strips the [System: ...] prompt-injection mitigation preamble from responses. UNSAFE for LLM clients (Claude, GPT, Cursor, ...) - they could ingest prompt-injection payloads embedded in Zabbix data such as host names, item descriptions, or problem text. Only enable for programmatic non-LLM consumers (Python scripts, n8n workflows that json.loads the response). Default: off.">
+                    <span class="toggle">
+                        <input type="checkbox" id="allow_raw_json_edit" name="allow_raw_json" value="1" {% if token.allow_raw_json %}checked{% endif %} onchange="toggleRawJsonWarningEdit(this)">
+                        <span class="toggle-slider"></span>
+                    </span>
+                    Allow raw JSON (no security disclaimer) <span class="tooltip-icon">&#x1F6C8;</span>
+                </label>
+                <div class="form-hint">Off by default. Only enable for non-LLM clients that need pure JSON for programmatic parsing - it disables the prompt-injection mitigation marker on tool responses.</div>
+                <div id="raw-json-warning-edit" class="alert alert-warning" style="margin-top:8px; {% if not token.allow_raw_json %}display:none;{% endif %}">
+                    <strong>&#x26A0; Warning:</strong> this token bypasses the prompt-injection mitigation preamble on tool responses. Use only with non-LLM clients (Python scripts, n8n, ...). Do not hand this token to Claude, GPT, Cursor, or any other LLM-driven client.
+                </div>
+                <script>
+                function toggleRawJsonWarningEdit(cb) {
+                    var w = document.getElementById('raw-json-warning-edit');
+                    if (w) { w.style.display = cb.checked ? '' : 'none'; }
+                }
+                </script>
+            </div>
+
+            <div class="form-group">
                 <label class="form-label" for="ip_allowlist">Token IP Restriction <span class="tooltip-icon" tabindex="0" data-tooltip="One IPv4/IPv6 address or CIDR per line. Empty = any client IP. Layered AFTER the global server-level allowlist - this can only narrow, never widen.">&#x1F6C8;</span></label>
                 <textarea id="ip_allowlist" name="ip_allowlist" class="form-textarea" rows="3">{{ token.allowed_ips | join('\n') if token.allowed_ips else '' }}</textarea>
                 <div class="form-hint">Complements the global IP allowlist in <a href="/settings">Settings</a> &mdash; cannot override it. If an IP is blocked globally, this token cannot allow it. One IP/CIDR per line.</div>

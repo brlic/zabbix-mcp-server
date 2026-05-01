@@ -222,6 +222,7 @@ async def token_create(request: Request) -> Response:
                 ctx["form_ip_allowlist"] = "\n".join(src.allowed_ips or [])
                 ctx["form_expires_at"] = src.expires_at or ""
                 ctx["form_read_only"] = bool(src.read_only)
+                ctx["form_allow_raw_json"] = bool(getattr(src, "allow_raw_json", False))
                 ctx["duplicated_from_name"] = src.name
         ctx.update(_get_global_context(admin_app))
         return admin_app.render("tokens/create.html", request, ctx)
@@ -245,6 +246,7 @@ async def token_create(request: Request) -> Response:
             "form_ip_allowlist": str(form.get("ip_allowlist", "") or ""),
             "form_expires_at": str(form.get("expires_at", "") or ""),
             "form_read_only": "read_only" in form,
+            "form_allow_raw_json": "allow_raw_json" in form,
             "form_scopes": str(form.get("scopes", "") or ""),
             "form_allowed_servers": str(form.get("allowed_servers", "") or ""),
         }
@@ -275,6 +277,7 @@ async def token_create(request: Request) -> Response:
         scopes = ["*"]
 
     read_only = "read_only" in form
+    allow_raw_json = "allow_raw_json" in form
     allowed_ips_raw = str(form.get("ip_allowlist", "")).strip()
     allowed_ips = [ip.strip() for ip in allowed_ips_raw.split("\n") if ip.strip()] if allowed_ips_raw else None
     # Validate every IP / CIDR before write so a typo cannot park a
@@ -349,6 +352,11 @@ async def token_create(request: Request) -> Response:
         token_data["allowed_ips"] = allowed_ips
     if expires_at:
         token_data["expires_at"] = expires_at
+    if allow_raw_json:
+        # Persist only when explicitly enabled, so existing config files
+        # stay clean and a future audit "grep allow_raw_json config.toml"
+        # only finds the tokens that have actually been opted in.
+        token_data["allow_raw_json"] = True
 
     try:
         add_config_table(admin_app.config_path, "tokens", token_id, token_data)
@@ -444,6 +452,11 @@ async def token_detail(request: Request) -> Response:
 
         read_only = "read_only" in form
         updates["read_only"] = read_only
+
+        # raw_json policy toggle - default false, must be re-confirmed on
+        # every edit so a checkbox left unchecked clears the flag rather
+        # than silently preserving it.
+        updates["allow_raw_json"] = "allow_raw_json" in form
 
         allowed_ips_raw = str(form.get("ip_allowlist", "")).strip()
         if allowed_ips_raw:

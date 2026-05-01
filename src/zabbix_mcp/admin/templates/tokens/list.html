@@ -84,6 +84,9 @@
                     {% else %}
                     <span class="badge badge-muted">Read/Write</span>
                     {% endif %}
+                    {% if token.allow_raw_json %}
+                    <span class="badge badge-danger tooltip-right" tabindex="0" data-tooltip="This token can call tools with raw_json=true, which strips the prompt-injection mitigation preamble. Only safe for non-LLM clients." style="margin-left:4px;">Raw JSON</span>
+                    {% endif %}
                 </td>
                 <td>
                     {% if token.allowed_ips %}
