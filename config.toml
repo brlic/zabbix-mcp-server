@@ -31,7 +31,7 @@ transport = "http"
 # IP address to bind the HTTP server to.
 #   "127.0.0.1" - Listen on localhost only (default, recommended for security).
 #   "0.0.0.0"   - Listen on all interfaces (use when clients connect from other hosts).
-host = "127.0.0.1"
+host = "0.0.0.0"
 
 # TCP port for the HTTP server (1–65535).
 port = 8080
@@ -58,7 +58,7 @@ port = 8080
 #   public_url = "https://mcp.example.com"
 # Example for direct exposure on a non-standard port with TLS:
 #   public_url = "https://mcp.example.com:8080"
-public_url = ""
+public_url = "https://mcpzabbix.brlic.com.br"
 
 # Logging level: "debug", "info", "warning", "error", "critical".
 #   "debug" logs every API call and its parameters - useful for troubleshooting.
@@ -459,13 +459,13 @@ update_check_enabled = true
 
 # Full URL of the Zabbix frontend (must start with http:// or https://).
 # The /api_jsonrpc.php path is added automatically by the API client.
-url = "https://zabbix.example.com"
+url = "http://noc-brlic-zabbix-frontend:8080"
 
 # Zabbix API token for authentication (REQUIRED).
 # This authenticates the MCP server to Zabbix — NOT the same as auth_token above.
 # Create one in Zabbix: User settings > API tokens > Create API token.
 # Tokens inherit the permissions of the Zabbix user they belong to.
-api_token = "your-api-token-here"
+api_token = "${ZABBIX_API_TOKEN}"
 
 # You can reference an environment variable instead of storing the token in plain text:
 # api_token = "${ZABBIX_PROD_TOKEN}"
