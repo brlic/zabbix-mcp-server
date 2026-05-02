@@ -72,11 +72,37 @@ COMMON_GET_PARAMS: list[ParamDef] = [
     ),
 ]
 
+# Reduced parameter set for singleton ``*.get`` methods that return one
+# global object (authentication.get, settings.get, housekeeping.get,
+# autoregistration.get, ...). These reject ``limit`` / ``filter`` /
+# ``search`` / sortfield etc. with ``Invalid parameter "/": unexpected
+# parameter "limit"`` because there is nothing to paginate or filter.
+SINGLETON_GET_PARAMS: list[ParamDef] = [
+    ParamDef(
+        "output", "str",
+        "Fields to return. Pass 'extend' (default) to get all available "
+        "fields or comma-separated field names for a custom selection.",
+    ),
+    ParamDef(
+        "extra_params", "dict",
+        "Additional API parameters not covered by the typed fields above. "
+        "Merged into the request as-is. Use this for selectXxx parameters "
+        "or any other Zabbix API parameter.",
+    ),
+]
+
 # Standard parameters for *.create methods (accepts full object as dict)
 CREATE_PARAMS: list[ParamDef] = [
     ParamDef(
         "params", "dict",
-        "Object properties as a JSON dictionary. See Zabbix API docs for required/optional fields.",
+        "All object properties wrapped in a single dictionary. Pass every "
+        "field the entity needs (name, type, references to parent IDs, "
+        "lists of nested objects, ...) inside this one ``params`` argument. "
+        "Example: ``{\"params\": {\"name\": \"My host group\"}}`` for "
+        "hostgroup_create, or ``{\"params\": {\"host\": \"web-01\", "
+        "\"groups\": [{\"groupid\": \"4\"}], \"interfaces\": [{...}]}}`` for "
+        "host_create. See Zabbix API docs for the required/optional fields "
+        "of each entity type.",
         required=True,
     ),
 ]
@@ -85,7 +111,10 @@ CREATE_PARAMS: list[ParamDef] = [
 UPDATE_PARAMS: list[ParamDef] = [
     ParamDef(
         "params", "dict",
-        "Object properties to update as a JSON dictionary. Must include the object ID field.",
+        "All update properties wrapped in a single dictionary - including "
+        "the object ID field that identifies which entity to update. "
+        "Example: ``{\"params\": {\"groupid\": \"42\", \"name\": \"renamed\"}}`` "
+        "for hostgroup_update.",
         required=True,
     ),
 ]
@@ -94,7 +123,11 @@ UPDATE_PARAMS: list[ParamDef] = [
 DELETE_PARAMS: list[ParamDef] = [
     ParamDef(
         "ids", "list[str]",
-        "Array of IDs to delete.",
+        "Array of object IDs to delete. Example: "
+        "``{\"ids\": [\"42\", \"43\"]}`` to delete two entities. The ID "
+        "field name in Zabbix's API differs by entity type (groupid, "
+        "hostid, ...) but this wrapper always accepts the generic ``ids`` "
+        "list and forwards it correctly.",
         required=True,
     ),
 ]

@@ -161,6 +161,22 @@ class TokenStore:
             hash_value = token_hash.split(":", 1)[1] if ":" in token_hash else token_hash
             token_prefix = hash_value[:12] + "..."
 
+            # allow_raw_json must be a real bool; reject string ``"true"`` /
+            # ``"false"`` etc. that an operator might typo into config.toml.
+            # bool("false") is True so a quiet bool() cast would silently
+            # opt-in - default to False on anything that is not exactly
+            # True or False, with a warning so the operator notices.
+            raw_arj = cfg.get("allow_raw_json", False)
+            if isinstance(raw_arj, bool):
+                allow_raw_json_val = raw_arj
+            else:
+                logger.warning(
+                    "Token '%s' has non-boolean allow_raw_json=%r in config; "
+                    "treating as False (use plain `true` / `false`)",
+                    token_id, raw_arj,
+                )
+                allow_raw_json_val = False
+
             info = TokenInfo(
                 id=token_id,
                 name=cfg.get("name", token_id),
@@ -173,7 +189,7 @@ class TokenStore:
                 expires_at=cfg.get("expires_at"),
                 is_legacy=cfg.get("is_legacy", False),
                 revoked=not cfg.get("is_active", True),
-                allow_raw_json=bool(cfg.get("allow_raw_json", False)),
+                allow_raw_json=allow_raw_json_val,
             )
 
             # Preserve runtime stats from existing token

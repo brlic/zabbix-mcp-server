@@ -47,6 +47,14 @@ class ZabbixServerConfig:
     read_only: bool = True
     verify_ssl: bool = True
     skip_version_check: bool = False
+    # Optional username + password used by ``graph_render`` to acquire
+    # a Zabbix frontend session cookie when the API token alone is
+    # rejected by ``/chart2.php`` (Zabbix 6.0+ frontend uses signed
+    # session cookies, which only ``user.login`` can produce). Leave
+    # empty to keep the token-only behaviour - graph_render will
+    # surface a clear error if the frontend rejects it.
+    frontend_username: str = ""
+    frontend_password: str = ""
     # Request timeout (seconds). A hung Zabbix frontend must not stall
     # the MCP thread pool indefinitely. Default 300 s matches the
     # Zabbix PHP frontend's max_execution_time (and typical nginx
@@ -84,6 +92,13 @@ class ServerConfig:
     cors_origins: list[str] | None = None
     allowed_import_dirs: list[str] | None = None
     allowed_hosts: list[str] | None = None
+    # Optional explicit Origin header allowlist for DNS rebinding protection
+    # (MCP 2025-11-25 §security). When unset and `public_url` is configured,
+    # the scheme://host[:port] derived from it is used. When unset on a
+    # localhost bind, FastMCP applies its own localhost wildcard defaults.
+    # Wildcard ports work as ``http://example.com:*``. Same shape as
+    # ``allowed_hosts`` but for the Origin header rather than Host.
+    allowed_origins: list[str] | None = None
     # IPs of reverse proxies whose X-Forwarded-For / Forwarded headers
     # we trust for client-IP attribution. Empty (default) means we only
     # ever use the raw TCP peer. Populate with e.g. ["127.0.0.1"] when
@@ -94,6 +109,13 @@ class ServerConfig:
     report_logo: str | None = None
     report_company: str = ""
     report_subtitle: str = "IT Monitoring Service"
+    # When the MCP runs over stdio (no bearer-token auth context),
+    # ``raw_json=true`` is rejected by default so an LLM client like
+    # Claude Desktop cannot strip its own prompt-injection mitigation.
+    # Operators driving the stdio process from a non-LLM script can
+    # opt in here. HTTP transport uses the per-token ``allow_raw_json``
+    # flag instead and ignores this setting.
+    stdio_allow_raw_json: bool = False
 
 
 @dataclass(frozen=True)
@@ -260,6 +282,8 @@ def _parse_zabbix_server(name: str, srv: object) -> "ZabbixServerConfig":
         read_only=srv.get("read_only", True),
         verify_ssl=srv.get("verify_ssl", True),
         skip_version_check=srv.get("skip_version_check", False),
+        frontend_username=str(srv.get("frontend_username", "")),
+        frontend_password=_resolve_env_vars(str(srv.get("frontend_password", ""))),
         request_timeout=int(srv.get("request_timeout", 300)),
     )
 
@@ -406,6 +430,42 @@ def load_config(path: str | Path) -> AppConfig:
             raise ConfigError("'allowed_hosts' must be a list of IP addresses or CIDR ranges")
         allowed_hosts = [str(h) for h in allowed_hosts_raw]
 
+    allowed_origins_raw = server_raw.get("allowed_origins")
+    allowed_origins: list[str] | None = None
+    if allowed_origins_raw is not None:
+        if not isinstance(allowed_origins_raw, list):
+            raise ConfigError("'allowed_origins' must be a list of origin URLs (e.g. 'https://app.example.com')")
+        from urllib.parse import urlsplit
+        cleaned: list[str] = []
+        for raw_origin in allowed_origins_raw:
+            entry = str(raw_origin).strip()
+            if not entry:
+                continue
+            if not entry.startswith(("http://", "https://")):
+                raise ConfigError(
+                    f"'allowed_origins' entry '{entry}' must start with http:// or https://"
+                )
+            # Strip the ``:*`` port-wildcard before URL parsing; it is
+            # FastMCP-internal syntax that urlsplit otherwise rejects.
+            probe = entry[:-2] if entry.endswith(":*") else entry
+            try:
+                parts = urlsplit(probe)
+            except ValueError as e:
+                raise ConfigError(f"'allowed_origins' entry '{entry}' is not a valid URL: {e}")
+            if not parts.hostname:
+                raise ConfigError(f"'allowed_origins' entry '{entry}' is missing a host")
+            if parts.path not in ("", "/"):
+                raise ConfigError(
+                    f"'allowed_origins' entry '{entry}' must not include a path - "
+                    f"drop everything after host[:port]"
+                )
+            if parts.query or parts.fragment:
+                raise ConfigError(
+                    f"'allowed_origins' entry '{entry}' must not include query / fragment"
+                )
+            cleaned.append(entry)
+        allowed_origins = cleaned or None
+
     trusted_proxies_raw = server_raw.get("trusted_proxies")
     trusted_proxies: list[str] | None = None
     if trusted_proxies_raw is not None:
@@ -439,12 +499,14 @@ def load_config(path: str | Path) -> AppConfig:
         cors_origins=cors_origins,
         allowed_import_dirs=allowed_import_dirs,
         allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
         trusted_proxies=trusted_proxies,
         compact_output=compact_output_raw,
         response_max_chars=response_max_chars_raw,
         report_logo=server_raw.get("report_logo"),
         report_company=server_raw.get("report_company", ""),
         report_subtitle=server_raw.get("report_subtitle", "IT Monitoring Service"),
+        stdio_allow_raw_json=bool(server_raw.get("stdio_allow_raw_json", False)),
     )
 
     zabbix_raw = raw.get("zabbix", {})

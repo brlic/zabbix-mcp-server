@@ -61,6 +61,53 @@
     <a href="/servers" class="btn btn-ghost">&#x1F50C; Test Zabbix Servers</a>
 </div>
 
+{% if tasks_panel %}
+<!-- Active Tasks (MCP 2025-11-25 experimental Tasks API) -->
+<div class="card" style="margin-top:1.5em;">
+    <div class="card-header">
+        <h2 class="card-title">&#x23F1; Active Tasks</h2>
+        <span class="text-sm text-muted">In-memory store for long-running tools (report_generate)</span>
+    </div>
+    <div class="card-body">
+        <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:1em;">
+            <div>
+                <div class="text-sm text-muted">Live tasks</div>
+                <div class="stat-value">{{ tasks_panel.live }} <span class="text-sm text-muted">/ {{ tasks_panel.max }}</span></div>
+                <div style="background:var(--bg-muted); height:6px; border-radius:3px; overflow:hidden; margin-top:4px;">
+                    <div style="width:{{ tasks_panel.usage_pct }}%; height:100%; background:{% if tasks_panel.usage_pct < 70 %}var(--green){% elif tasks_panel.usage_pct < 90 %}var(--yellow){% else %}var(--red){% endif %};"></div>
+                </div>
+                <div class="text-sm text-muted" style="margin-top:2px;">{{ tasks_panel.usage_pct }}% capacity</div>
+            </div>
+            <div>
+                <div class="text-sm text-muted">Oldest task</div>
+                <div class="stat-value">
+                    {% if tasks_panel.oldest_age_s is none %}
+                    <span class="text-muted">-</span>
+                    {% elif tasks_panel.oldest_age_s < 60 %}
+                    {{ tasks_panel.oldest_age_s }} s
+                    {% elif tasks_panel.oldest_age_s < 3600 %}
+                    {{ (tasks_panel.oldest_age_s // 60) }} m
+                    {% else %}
+                    {{ (tasks_panel.oldest_age_s // 3600) }} h
+                    {% endif %}
+                </div>
+                <div class="text-sm text-muted">since createdAt</div>
+            </div>
+            <div>
+                <div class="text-sm text-muted">Default TTL</div>
+                <div class="stat-value">{{ tasks_panel.default_ttl_min }} min</div>
+                <div class="text-sm text-muted">when client omits ttl</div>
+            </div>
+            <div>
+                <div class="text-sm text-muted">TTL ceiling</div>
+                <div class="stat-value">{{ tasks_panel.max_ttl_h }} h</div>
+                <div class="text-sm text-muted">max client-supplied</div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endif %}
+
 <!-- Recent Audit Activity -->
 <div class="card">
     <div class="card-header">

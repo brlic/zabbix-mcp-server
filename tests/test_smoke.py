@@ -620,7 +620,7 @@ class TestSourceFile(unittest.TestCase):
         params = {"source_file": "/etc/passwd"}
         with self.assertRaises(ValueError) as ctx:
             _resolve_source_file(params, allowed_import_dirs=["/tmp/safe"])
-        self.assertIn("allowed import directories", str(ctx.exception))
+        self.assertIn("allowed import directory", str(ctx.exception))
 
     def test_missing_file_raises(self):
         import tempfile
@@ -1514,14 +1514,14 @@ class TestSecurityPathTraversal(unittest.TestCase):
         params = {"source_file": os.path.join(allowed, "..", "..", "etc", "passwd")}
         with self.assertRaises(ValueError) as ctx:
             _resolve_source_file(params, allowed_import_dirs=[allowed])
-        self.assertIn("allowed import directories", str(ctx.exception))
+        self.assertIn("allowed import directory", str(ctx.exception))
 
     def test_absolute_path_outside_allowed(self):
         """Absolute path outside allowed dirs is rejected."""
         params = {"source_file": "/etc/shadow"}
         with self.assertRaises(ValueError) as ctx:
             _resolve_source_file(params, allowed_import_dirs=["/opt/zabbix-mcp/imports"])
-        self.assertIn("allowed import directories", str(ctx.exception))
+        self.assertIn("allowed import directory", str(ctx.exception))
 
     def test_symlink_rejected(self):
         """Symlink pointing to a valid file inside allowed dir is still rejected."""

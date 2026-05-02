@@ -396,12 +396,18 @@ class TestRawJsonPolicy(unittest.TestCase):
         current_token_info.set(TokenInfo(id="t", name="T", token_hash="x", allow_raw_json=True))
         self.assertIsNone(_check_raw_json_allowed(True))
 
-    def test_check_allows_when_no_token_context(self):
+    def test_check_denies_when_no_token_context_by_default(self):
         from zabbix_mcp.server import _check_raw_json_allowed
         from zabbix_mcp.token_store import current_token_info
-        # stdio mode / pre-auth: no token to gate on, so do not block.
+        # stdio mode / pre-auth: deny by default so an LLM stdio client
+        # (Claude Desktop) cannot strip its own prompt-injection
+        # mitigation just by setting raw_json=true. Operators wanting
+        # raw JSON from a non-LLM stdio script opt in via
+        # [server].stdio_allow_raw_json = true.
         current_token_info.set(None)
-        self.assertIsNone(_check_raw_json_allowed(True))
+        err = _check_raw_json_allowed(True)
+        self.assertIsNotNone(err)
+        self.assertIn("stdio mode", err)
 
     def test_format_result_strips_preamble_when_true(self):
         from zabbix_mcp.server import _format_result, _UNTRUSTED_PREAMBLE
@@ -409,6 +415,271 @@ class TestRawJsonPolicy(unittest.TestCase):
         out_raw = _format_result("payload", True)
         self.assertTrue(out_with.startswith(_UNTRUSTED_PREAMBLE))
         self.assertEqual(out_raw, "payload")
+
+
+# ---------------------------------------------------------------------------
+# MCP 2025-11-25 protocol upgrade helpers
+# ---------------------------------------------------------------------------
+class TestProtocol202511(unittest.TestCase):
+    """Coverage for the MCP 2025-11-25 protocol upgrade pieces.
+
+    Three things matter for the upgrade we want to verify:
+    - Origin/Host validation flips on once the operator declares either
+      a public_url or an explicit allowed_* list (BC: stays off in the
+      no-config case so existing localhost setups keep working).
+    - Tool-level error returns from extension functions are converted to
+      the SEP-1303 isError shape via ToolError, instead of leaking out
+      as 'successful' tool results carrying error JSON.
+    - The bundled server icon is reachable as a data: URI so clients
+      that render server icons (Inspector, Claude Desktop) get one
+      without needing an extra static-file endpoint.
+    """
+
+    def test_transport_security_returns_none_when_unset(self):
+        """No public_url + no allowed_* lists -> let FastMCP decide.
+
+        In the no-config case we let FastMCP fall back to its localhost
+        defaults; that keeps backwards compat with existing 127.0.0.1
+        deployments and avoids surprising operators with 403s right after
+        the upgrade.
+        """
+        from zabbix_mcp.server import _build_transport_security
+        from zabbix_mcp.config import AppConfig, ServerConfig
+        cfg = AppConfig.__new__(AppConfig)
+        srv = ServerConfig(
+            transport="http", host="0.0.0.0", port=8080,
+            log_level="info", log_file=None,
+            auth_token=None, rate_limit=300,
+        )
+        object.__setattr__(cfg, "server", srv)
+        object.__setattr__(cfg, "zabbix_servers", {})
+        self.assertIsNone(_build_transport_security(cfg, "0.0.0.0", 8080))
+
+    def test_transport_security_built_from_public_url(self):
+        """public_url alone is enough to flip protection on.
+
+        We derive Host (host[:port]) and Origin (scheme://host[:port])
+        from the URL the operator already configured for OAuth /
+        wizard, so they don't have to maintain a second list.
+        """
+        from zabbix_mcp.server import _build_transport_security
+        from zabbix_mcp.config import AppConfig, ServerConfig
+        cfg = AppConfig.__new__(AppConfig)
+        srv = ServerConfig(
+            transport="http", host="0.0.0.0", port=8080,
+            log_level="info", log_file=None,
+            auth_token=None, rate_limit=300,
+            public_url="https://mcp.example.com",
+        )
+        object.__setattr__(cfg, "server", srv)
+        object.__setattr__(cfg, "zabbix_servers", {})
+        ts = _build_transport_security(cfg, "0.0.0.0", 8080)
+        self.assertIsNotNone(ts)
+        self.assertTrue(ts.enable_dns_rebinding_protection)
+        self.assertIn("mcp.example.com", ts.allowed_hosts)
+        self.assertIn("https://mcp.example.com", ts.allowed_origins)
+        # Local probes must keep working for the same-box health check.
+        self.assertIn("127.0.0.1:8080", ts.allowed_hosts)
+
+    def test_raise_if_extension_error_converts_error_json(self):
+        """Bridge for legacy {'error': '...'} extension returns -> ToolError.
+
+        SEP-1303 (clarified in 2025-11-25) wants tool-level failures to
+        surface as CallToolResult(isError=True). Our extension functions
+        in api/extensions.py predate that and return error JSON strings;
+        this helper re-raises so FastMCP marks isError correctly.
+        """
+        from zabbix_mcp.server import _raise_if_extension_error
+        from mcp.server.fastmcp.exceptions import ToolError
+        with self.assertRaises(ToolError) as cm:
+            _raise_if_extension_error('{"error": "bad input"}')
+        self.assertIn("bad input", str(cm.exception))
+
+    def test_raise_if_extension_error_wraps_success_in_preamble(self):
+        from zabbix_mcp.server import _raise_if_extension_error, _UNTRUSTED_PREAMBLE
+        good = '{"items": [{"id": "1"}]}'
+        out = _raise_if_extension_error(good)
+        self.assertTrue(out.startswith(_UNTRUSTED_PREAMBLE))
+        self.assertIn(good, out)
+        # raw_json=True keeps the bare JSON for non-LLM consumers.
+        self.assertEqual(_raise_if_extension_error(good, raw_json=True), good)
+
+    def test_raise_if_extension_error_wraps_non_json_in_preamble(self):
+        from zabbix_mcp.server import _raise_if_extension_error, _UNTRUSTED_PREAMBLE
+        plain = "data:image/png;base64,iVBORw0KGgo..."
+        out = _raise_if_extension_error(plain)
+        self.assertTrue(out.startswith(_UNTRUSTED_PREAMBLE))
+        self.assertIn(plain, out)
+        self.assertEqual(_raise_if_extension_error(plain, raw_json=True), plain)
+
+    def test_server_icons_loadable_as_data_uri(self):
+        """Bundled brand SVG must resolve from package data and embed inline."""
+        from zabbix_mcp.server import _load_server_icons
+        icons = _load_server_icons()
+        self.assertIsNotNone(icons)
+        self.assertEqual(len(icons), 1)
+        self.assertTrue(icons[0].src.startswith("data:image/svg+xml;base64,"))
+
+    def test_allowed_origins_rejects_garbage_in_config(self):
+        """A non-URL string in [server].allowed_origins must abort load_config.
+
+        The Settings UI catches typos before they hit disk, but a hand
+        edit of config.toml goes straight through. validate_config() in
+        install.sh calls load_config too, so this is the same bar that
+        the upgrade path enforces.
+        """
+        import tempfile, textwrap, os
+        from zabbix_mcp.config import load_config, ConfigError
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
+            f.write(textwrap.dedent('''
+                [server]
+                transport = "http"
+                host = "127.0.0.1"
+                port = 8080
+                allowed_origins = ["not a url"]
+
+                [zabbix.prod]
+                url = "https://z.example.com"
+                api_token = "tok"
+            '''))
+            path = f.name
+        try:
+            with self.assertRaises(ConfigError) as cm:
+                load_config(path)
+            self.assertIn("allowed_origins", str(cm.exception))
+        finally:
+            os.unlink(path)
+
+    def test_allowed_origins_accepts_port_wildcard(self):
+        """``https://app.example.com:*`` is valid (FastMCP port-wildcard)."""
+        import tempfile, textwrap, os
+        from zabbix_mcp.config import load_config
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
+            f.write(textwrap.dedent('''
+                [server]
+                transport = "http"
+                host = "127.0.0.1"
+                port = 8080
+                allowed_origins = ["https://app.example.com:*", "https://office.example.com"]
+
+                [zabbix.prod]
+                url = "https://z.example.com"
+                api_token = "tok"
+            '''))
+            path = f.name
+        try:
+            cfg = load_config(path)
+            self.assertEqual(
+                cfg.server.allowed_origins,
+                ["https://app.example.com:*", "https://office.example.com"],
+            )
+        finally:
+            os.unlink(path)
+
+    def test_allow_raw_json_strict_bool_only(self):
+        """A string ``"false"`` in allow_raw_json must NOT parse as True.
+
+        TOML's bool type is `true` / `false`; an operator who quotes the
+        value by mistake (``allow_raw_json = "false"``) used to produce
+        ``bool("false") == True`` - an LLM token would silently get the
+        escape hatch. Now we treat anything non-bool as False with a
+        warning.
+        """
+        from zabbix_mcp.token_store import TokenStore
+        store = TokenStore()
+        store.load_from_config({
+            "stringly_typed": {
+                "name": "S", "token_hash": "sha256:aaa",
+                "allow_raw_json": "false",  # the bug-bait
+            },
+            "real_true": {
+                "name": "R", "token_hash": "sha256:bbb",
+                "allow_raw_json": True,
+            },
+        })
+        self.assertFalse(store.get_token("stringly_typed").allow_raw_json)
+        self.assertTrue(store.get_token("real_true").allow_raw_json)
+
+
+# ---------------------------------------------------------------------------
+# Tasks API (MCP 2025-11-25 experimental) - bounded store + helpers
+# ---------------------------------------------------------------------------
+class TestTasksAPI(unittest.IsolatedAsyncioTestCase):
+    """Coverage for the bounded task store and FastMCP integration glue.
+
+    Three things matter for the Tasks API rollout:
+    - The store must enforce TTL bounds (default + ceiling) so a buggy
+      or hostile client cannot pin multi-megabyte payloads in RAM.
+    - It must reject create_task once the live cap is reached, with a
+      clear retryable error (not silent OOM).
+    - The FastMCP convert_result monkey-patch must propagate
+      CreateTaskResult through to the low-level server unchanged, but
+      pass other return types through to the original logic.
+    """
+
+    async def test_default_ttl_when_client_omits(self):
+        """Missing ``task: {ttl: ...}`` -> our default is filled in.
+
+        Otherwise the upstream store treats ``ttl=None`` as
+        "live forever" and we accumulate stale tasks across requests.
+        """
+        from zabbix_mcp.task_store import BoundedInMemoryTaskStore, DEFAULT_TTL_MS
+        from mcp.types import TaskMetadata
+        store = BoundedInMemoryTaskStore()
+        task = await store.create_task(TaskMetadata())
+        self.assertEqual(task.ttl, DEFAULT_TTL_MS)
+
+    async def test_ttl_capped_at_ceiling(self):
+        """A client-supplied TTL larger than MAX gets clamped, not honored."""
+        from zabbix_mcp.task_store import BoundedInMemoryTaskStore, MAX_TTL_MS
+        from mcp.types import TaskMetadata
+        store = BoundedInMemoryTaskStore()
+        task = await store.create_task(TaskMetadata(ttl=MAX_TTL_MS * 10))
+        self.assertEqual(task.ttl, MAX_TTL_MS)
+
+    async def test_max_live_tasks_enforced(self):
+        """Once the soft cap is hit, create_task raises TaskStoreFull."""
+        from zabbix_mcp.task_store import BoundedInMemoryTaskStore, TaskStoreFull
+        from mcp.types import TaskMetadata
+        store = BoundedInMemoryTaskStore(max_live_tasks=2)
+        await store.create_task(TaskMetadata(ttl=60_000))
+        await store.create_task(TaskMetadata(ttl=60_000))
+        with self.assertRaises(TaskStoreFull):
+            await store.create_task(TaskMetadata(ttl=60_000))
+
+    async def test_explicit_ttl_under_ceiling_passes_through(self):
+        """A reasonable client-supplied TTL is preserved unchanged."""
+        from zabbix_mcp.task_store import BoundedInMemoryTaskStore
+        from mcp.types import TaskMetadata
+        store = BoundedInMemoryTaskStore()
+        task = await store.create_task(TaskMetadata(ttl=30_000))
+        self.assertEqual(task.ttl, 30_000)
+
+    def test_convert_result_patch_propagates_create_task_result(self):
+        """CreateTaskResult must reach the low-level server unmolested.
+
+        FastMCP's stock convert_result would stringify it; the patch
+        recognises and returns it as-is. Idempotent so calling
+        _patch... twice is safe (e.g. on reload).
+        """
+        from zabbix_mcp.server import _patch_fastmcp_convert_result_for_tasks
+        from mcp.server.fastmcp.utilities import func_metadata as fm
+        from mcp.types import CreateTaskResult, Task
+        _patch_fastmcp_convert_result_for_tasks()
+        # call again: should be idempotent
+        _patch_fastmcp_convert_result_for_tasks()
+
+        from datetime import datetime, timezone
+        sample = CreateTaskResult(task=Task(
+            taskId="t-1", status="working", ttl=60_000,
+            createdAt=datetime.now(timezone.utc),
+            lastUpdatedAt=datetime.now(timezone.utc),
+        ))
+        # Use a real FuncMetadata instance so we exercise the patched method
+        from unittest.mock import MagicMock
+        instance = MagicMock(spec=fm.FuncMetadata)
+        out = fm.FuncMetadata.convert_result(instance, sample)
+        self.assertIs(out, sample)
 
 
 # ---------------------------------------------------------------------------

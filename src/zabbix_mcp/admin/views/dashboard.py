@@ -107,6 +107,34 @@ async def dashboard(request: Request) -> Response:
         except Exception:
             pass
 
+    # Tasks API stats (MCP 2025-11-25). Sourced from the BoundedInMemoryTaskStore
+    # we attached to config in server.run_server(). Falls back gracefully if the
+    # store is not present (admin portal can be served without the MCP server
+    # half running, e.g. during install validation).
+    tasks_panel: dict | None = None
+    _task_store = getattr(admin_app.config, "_task_store", None)
+    if _task_store is not None:
+        try:
+            from datetime import datetime, timezone
+            _task_store._cleanup_expired()
+            live = list(_task_store._tasks.values())
+            now = datetime.now(timezone.utc)
+            oldest_age = None
+            if live:
+                oldest = min(s.task.createdAt for s in live)
+                oldest_age = int((now - oldest).total_seconds())
+            cap = _task_store._max_live_tasks
+            tasks_panel = {
+                "live": len(live),
+                "max": cap,
+                "usage_pct": int(round(100 * len(live) / cap)) if cap else 0,
+                "oldest_age_s": oldest_age,
+                "default_ttl_min": _task_store._default_ttl_ms // 60_000,
+                "max_ttl_h": _task_store._max_ttl_ms // 3_600_000,
+            }
+        except Exception:
+            logger.exception("Failed to compute tasks panel stats")
+
     return admin_app.render("dashboard.html", request, {
         "active": "dashboard",
         "stats": {
@@ -119,4 +147,5 @@ async def dashboard(request: Request) -> Response:
         },
         "servers": servers,
         "audit_entries": recent_audit[:10],
+        "tasks_panel": tasks_panel,
     })

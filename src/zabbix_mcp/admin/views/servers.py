@@ -546,10 +546,21 @@ async def server_test_new(request: Request) -> Response:
     from urllib.parse import urlparse
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
-    # Block obvious internal targets
+
+    # Block obvious internal targets. ``endswith("." + b)`` only makes
+    # sense when ``b`` is a hostname - applying it to an IP literal
+    # (e.g. "127.0.0.1") would falsely block legitimate hostnames that
+    # happen to end with ".127.0.0.1" (rare but real - some DNS
+    # configurations). Detect IP-shaped strings and skip the
+    # subdomain rule for them.
     _blocked = ("localhost", "127.0.0.1", "::1", "0.0.0.0", "metadata.google", "169.254.169.254")
-    if any(hostname == b or hostname.endswith("." + b) for b in _blocked):
-        return HTMLResponse('<span class="text-danger">URL points to a blocked internal address</span>')
+    def _is_ip_literal(s: str) -> bool:
+        return all(c.isdigit() or c in ".:" for c in s)
+    for b in _blocked:
+        if hostname == b:
+            return HTMLResponse('<span class="text-danger">URL points to a blocked internal address</span>')
+        if not _is_ip_literal(b) and hostname.endswith("." + b):
+            return HTMLResponse('<span class="text-danger">URL points to a blocked internal address</span>')
 
     # SECURITY: resolve hostname and block only loopback / link-local /
     # reserved (covers AWS metadata 169.254.169.254 etc). RFC1918 private
@@ -557,13 +568,35 @@ async def server_test_new(request: Request) -> Response:
     # they are exactly where Zabbix typically lives, and blocking them
     # made the entire admin portal unable to add a server in 90% of
     # real deployments (reported by tester 2026-04-17).
+    #
+    # Resolve ALL IPs (not just the first one). DNS rebinding can return
+    # a public IP first and a loopback / metadata address second; if we
+    # only check [0] the second IP slips through and ZabbixAPI may then
+    # connect to it. Block the URL when ANY resolved IP is internal.
+    # Reported by @fsolen on the public fork (bug/dns-resolution-fix).
     import socket
+    from ipaddress import ip_address as _ip
     try:
-        resolved_ip = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)[0][4][0]
-        from ipaddress import ip_address as _ip
-        addr = _ip(resolved_ip)
-        if addr.is_loopback or addr.is_link_local or addr.is_reserved:
-            return HTMLResponse('<span class="text-danger">URL resolves to a loopback / link-local / reserved address (blocked)</span>')
+        addrinfo = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        for entry in addrinfo:
+            try:
+                addr = _ip(entry[4][0])
+            except ValueError:
+                continue
+            # Unwrap IPv4-mapped IPv6 (``::ffff:127.0.0.1`` -> ``127.0.0.1``)
+            # so the "loopback" check sees the real IPv4 underneath.
+            if hasattr(addr, "ipv4_mapped") and addr.ipv4_mapped is not None:
+                addr = addr.ipv4_mapped
+            # ``is_unspecified`` covers ``0.0.0.0`` / ``::`` - a TCP
+            # connect to the wildcard address reaches a service bound
+            # to the same port on localhost on Linux/BSD, so blocking
+            # the literal in ``_blocked`` was not enough on its own
+            # (e.g. ``http://0`` parses as host="0" which resolves to
+            # ``0.0.0.0``). ``is_multicast`` is included as defence in
+            # depth - no Zabbix instance lives there.
+            if (addr.is_loopback or addr.is_link_local or addr.is_reserved
+                    or addr.is_unspecified or addr.is_multicast):
+                return HTMLResponse('<span class="text-danger">URL resolves to a loopback / link-local / reserved / unspecified address (blocked)</span>')
     except (socket.gaierror, ValueError):
         pass  # Let ZabbixAPI handle DNS errors
 

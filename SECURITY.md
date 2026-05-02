@@ -55,6 +55,27 @@ We will acknowledge your report within 48 hours and work with you on a fix.
 - The `rate_limit` config option protects the Zabbix API from being overwhelmed (default: 300 calls/minute per client)
 - SSRF prevention — server test endpoint validates URL scheme and resolves DNS to block private/loopback/reserved IPs
 
+### Origin / Host validation (DNS rebinding protection)
+
+Per the MCP 2025-11-25 spec, the server can reject requests whose `Origin` or `Host` header does not match the operator-declared allowlist (returns HTTP 403 / 421 respectively). This blocks DNS rebinding attacks against an MCP endpoint reachable from a browser context.
+
+**Recommended minimum configuration for production**: set `[server].public_url` to the externally-reachable URL of the server, e.g.
+
+```toml
+[server]
+public_url = "https://mcp.example.com"
+```
+
+The host (`mcp.example.com`) is auto-added to the Host allowlist, the origin (`https://mcp.example.com`) to the Origin allowlist, and DNS-rebinding protection flips on. No further config needed for the typical reverse-proxy deployment.
+
+For additional origins (e.g. an internal admin dashboard at a different URL), populate `[server].allowed_origins`:
+
+```toml
+allowed_origins = ["https://app.example.com", "https://office.example.com:*"]
+```
+
+When `public_url`, `allowed_origins`, and `allowed_hosts` are all unset on a non-localhost bind, protection stays off (backwards compat) and the server logs a startup warning pointing here.
+
 ### Read-Only Mode
 
 - Servers are configured as `read_only = true` by default
@@ -83,11 +104,11 @@ We will acknowledge your report within 48 hours and work with you on a fix.
 
 | Version | Supported |
 |---|---|
-| 1.25 (latest) | Yes |
+| 1.26 (latest) | Yes |
+| 1.25 | Yes |
 | 1.24 | Yes |
 | 1.23 | Yes |
 | 1.22 | Yes |
 | 1.21 | Yes |
 | 1.20 | Yes |
-| 1.19 | Yes |
-| < 1.19 | No |
+| < 1.20 | No |

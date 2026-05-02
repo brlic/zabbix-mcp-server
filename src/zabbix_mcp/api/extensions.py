@@ -31,7 +31,9 @@ import math
 import re
 import ssl
 import time
+import http.cookiejar
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -83,6 +85,13 @@ def _error_json(error: str) -> str:
 # ---------------------------------------------------------------------------
 # 1. Graph Image Export
 # ---------------------------------------------------------------------------
+
+# Cache: server_name -> signed ``Cookie`` value for chart2.php.
+# Populated by graph_render's user.login fallback when frontend
+# credentials are present. Cookie validity is bounded by Zabbix's
+# session ttl (default 14 days), so caching for the lifetime of the
+# MCP server process is fine.
+_GRAPH_SESSION_CACHE: dict[str, str] = {}
 
 
 def graph_render(
@@ -141,20 +150,86 @@ def graph_render(
         )
 
         # --- Build HTTP request with auth ---
+        # Auth strategy:
+        #   1. Bearer ``Authorization`` (Zabbix 5.4 - legacy frontend
+        #      that still honoured tokens on chart2.php).
+        #   2. ``zbx_sessionid=<api_token>`` cookie (older path -
+        #      Zabbix 5.x stored the API token straight as the session
+        #      id).
+        #   3. NEW (Zabbix 6.0+): a signed session produced by
+        #      ``user.login`` with a username + password set in
+        #      ``[zabbix.<server>].frontend_username/_password``. The
+        #      token-only paths above are quietly ignored by 6.0+, so
+        #      this is the only path that actually returns a PNG on
+        #      modern installs.
         req = urllib.request.Request(chart_url)
 
-        # Primary: Bearer token auth (Zabbix 5.4+).
-        # Fallback: cookie-based session auth.
         api_token = srv_config.api_token
         if api_token:
             req.add_header("Authorization", f"Bearer {api_token}")
 
-        # Also send session cookie as fallback for older Zabbix or cookie-only
-        # frontend auth.  The session ID is stored in the ZabbixAPI client.
         client = client_manager._get_client(server_name)
         session_id = getattr(client, "_ZabbixAPI__session_id", None)
         if session_id:
             req.add_header("Cookie", f"zbx_sessionid={session_id}")
+
+        # If the operator gave us frontend credentials, log in through
+        # the BROWSER login form (``index.php?login=1``). This is the
+        # only way to get the signed ``zbx_session`` cookie that Zabbix
+        # 6.0+ requires on chart2.php - the ``user.login`` JSON-RPC
+        # method only returns a bare session id string, while the
+        # frontend session needs the HMAC-signed wrapped cookie that
+        # the PHP login flow produces. Cache the cookie per server in
+        # a module-level dict (the zabbix_utils client overrides
+        # __setattr__ for attribute caching, so we cannot stash extra
+        # state on it directly).
+        signed_cookie = _GRAPH_SESSION_CACHE.get(server_name)
+        fe_user = getattr(srv_config, "frontend_username", "") or ""
+        fe_pass = getattr(srv_config, "frontend_password", "") or ""
+        # Refuse to send the frontend password over plain HTTP. The
+        # Zabbix login form posts ``name``/``password`` as form-data;
+        # without TLS it is recoverable from any LAN sniffer.
+        if fe_user and fe_pass and not base_url.lower().startswith("https://"):
+            logger.warning(
+                "graph_render: refusing to send frontend credentials "
+                "over plain HTTP for server %r; configure https:// or "
+                "leave frontend_username/_password empty.",
+                server_name,
+            )
+            fe_user = fe_pass = ""
+        if fe_user and fe_pass and not signed_cookie:
+            try:
+                cj = http.cookiejar.CookieJar()
+                login_handlers: list = [urllib.request.HTTPCookieProcessor(cj)]
+                if not srv_config.verify_ssl:
+                    skip_ssl = ssl.create_default_context()
+                    skip_ssl.check_hostname = False
+                    skip_ssl.verify_mode = ssl.CERT_NONE
+                    login_handlers.append(urllib.request.HTTPSHandler(context=skip_ssl))
+                login_opener = urllib.request.build_opener(*login_handlers)
+                login_form = urllib.parse.urlencode({
+                    "name": fe_user,
+                    "password": fe_pass,
+                    "autologin": "1",
+                    "enter": "Sign in",
+                }).encode("utf-8")
+                login_url = f"{base_url}/index.php?login=1"
+                with login_opener.open(
+                    urllib.request.Request(login_url, data=login_form),
+                    timeout=10,
+                ) as _r:
+                    pass
+                cookie_pairs = []
+                for c in cj:
+                    if c.name in ("zbx_session", "zbx_sessionid"):
+                        cookie_pairs.append(f"{c.name}={c.value}")
+                if cookie_pairs:
+                    signed_cookie = "; ".join(cookie_pairs)
+                    _GRAPH_SESSION_CACHE[server_name] = signed_cookie
+            except Exception as _login_err:
+                logger.debug("frontend login fallback failed: %s", _login_err)
+        if signed_cookie:
+            req.add_header("Cookie", signed_cookie)
 
         # --- SSL context ---
         ssl_ctx: ssl.SSLContext | None = None
@@ -170,7 +245,12 @@ def graph_render(
 
         content_type = response.headers.get("Content-Type", "")
         if "image" not in content_type:
-            # Probably an HTML error / login page
+            # Probably an HTML error / login page. Drop the cached
+            # frontend cookie so the next call re-logs-in instead of
+            # reusing a session that the Zabbix frontend has already
+            # invalidated (rotated cookie, idle timeout, password
+            # change, ...).
+            _GRAPH_SESSION_CACHE.pop(server_name, None)
             snippet = data[:500].decode("utf-8", errors="replace")
             logger.warning(
                 "Graph fetch returned non-image Content-Type '%s': %s",
@@ -190,6 +270,11 @@ def graph_render(
         })
 
     except urllib.error.HTTPError as exc:
+        # 401 / 403 typically means the cached frontend cookie is no
+        # longer valid; drop it so the next call re-logs-in instead
+        # of looping on the same dead cookie.
+        if exc.code in (401, 403):
+            _GRAPH_SESSION_CACHE.pop(server_name, None)
         logger.error("HTTP error fetching graph: %s %s", exc.code, exc.reason)
         return _error_json(
             f"HTTP {exc.code} from Zabbix frontend: {exc.reason}. "

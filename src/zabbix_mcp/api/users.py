@@ -33,7 +33,7 @@ This module covers the "Users & Authentication" domain of the Zabbix API:
 """
 
 from zabbix_mcp.api.types import MethodDef, ParamDef
-from zabbix_mcp.api.common import COMMON_GET_PARAMS, CREATE_PARAMS, UPDATE_PARAMS, DELETE_PARAMS
+from zabbix_mcp.api.common import COMMON_GET_PARAMS, SINGLETON_GET_PARAMS, CREATE_PARAMS, UPDATE_PARAMS, DELETE_PARAMS
 
 # ---------------------------------------------------------------------------
 # user
@@ -141,25 +141,44 @@ _USER_METHODS: list[MethodDef] = [
         description=(
             "Log out the current API session. Invalidates the session token so "
             "it can no longer be used for API calls. Good practice for cleanup "
-            "after scripted workflows."
+            "after scripted workflows. Requires ``auth_sessionid`` to be set "
+            "to the session id from a prior ``user.login`` call - the "
+            "configured server-level api_token cannot be used here because "
+            "logging it out would break every subsequent call from this MCP."
         ),
         read_only=False,
-        params=[],
+        params=[
+            ParamDef(
+                "auth_sessionid", "str",
+                "Session id from a prior user.login call. The MCP wrapper "
+                "uses this for the auth field instead of the server-level "
+                "api_token, so invalidating it does not affect other tools.",
+                required=True,
+            ),
+        ],
     ),
     MethodDef(
         api_method="user.checkAuthentication",
         tool_name="user_checkauthentication",
         description=(
-            "Check whether a session or API token is still valid. If the token is "
-            "valid, returns the authenticated user's details. Useful for health "
-            "checks or verifying a stored token before making further calls."
+            "Check whether a session is still valid. Returns the authenticated "
+            "user's details if so. Requires ``auth_sessionid`` to be set to a "
+            "session id (typically from a prior ``user.login``); the configured "
+            "server-level api_token cannot validate against the session table."
         ),
         read_only=True,
         params=[
             ParamDef(
-                "token", "str",
-                "API token to validate. If omitted, the current session token "
-                "is checked.",
+                "auth_sessionid", "str",
+                "Session id from a prior user.login call. The MCP wrapper "
+                "passes it as the request's auth field; the call validates "
+                "exactly this session id.",
+                required=True,
+            ),
+            ParamDef(
+                "sessionid", "str",
+                "Session id whose validity should be checked. If omitted, "
+                "the auth_sessionid (the calling session) is checked instead.",
             ),
         ],
     ),
@@ -360,10 +379,20 @@ _USERDIRECTORY_METHODS: list[MethodDef] = [
             "Test an LDAP or SAML directory connection without saving it. Verifies "
             "that Zabbix can connect to the directory server with the provided "
             "parameters and optionally performs a test authentication. Use this "
-            "before creating or updating a directory to validate settings."
+            "before creating or updating a directory to validate settings. "
+            "Authenticates with the configured server-level api_token by default; "
+            "set ``auth_sessionid`` to a session id from ``user.login`` if your "
+            "Zabbix configuration restricts userdirectory.test to interactive "
+            "sessions."
         ),
         read_only=True,
         params=[
+            ParamDef(
+                "auth_sessionid", "str",
+                "Optional session id from a prior user.login call. When set, "
+                "the wrapper uses it for the JSON-RPC auth header instead of "
+                "the configured api_token.",
+            ),
             ParamDef(
                 "params", "dict",
                 "Test LDAP/SAML directory connection parameters. Include "
@@ -539,7 +568,7 @@ _AUTHENTICATION_METHODS: list[MethodDef] = [
             "singleton object -- there are no IDs to filter by."
         ),
         read_only=True,
-        params=COMMON_GET_PARAMS,
+        params=SINGLETON_GET_PARAMS,
     ),
     MethodDef(
         api_method="authentication.update",

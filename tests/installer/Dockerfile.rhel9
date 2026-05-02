@@ -1,5 +1,9 @@
 # RHEL 9 / Rocky 9 — python3.9 default, python3.11/3.12 available via dnf
-FROM rockylinux:9
+# NOTE: ``rockylinux/rockylinux:9`` (namespaced) instead of bare
+# ``rockylinux:9`` because the bare tag currently points at 9.7, whose
+# BaseOS repodata returns 404 from every public mirror after the 9.8
+# promotion. The namespaced image refreshes its mirror list correctly.
+FROM rockylinux/rockylinux:9
 
 RUN dnf install -y python3.11 python3.11-pip && dnf clean all
 

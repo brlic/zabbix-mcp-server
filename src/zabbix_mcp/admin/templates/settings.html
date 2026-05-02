@@ -191,6 +191,13 @@
             </div>
         </div>
         <div class="settings-row">
+            <div class="settings-label">Origin Allowlist <span class="tooltip-icon" tabindex="0" data-tooltip="MCP 2025-11-25 DNS-rebinding protection. Allowed Origin header values - bad Origin returns HTTP 403. The host derived from Public URL above is added automatically; this list adds extras (e.g. an internal admin dashboard at a different URL). Wildcard ports work as 'https://example.com:*'. Whole protection layer is OFF when Public URL + this list + IP Allowlist are all empty (BC).">&#x1F6C8;</span></div>
+            <div>
+                <textarea name="allowed_origins" class="form-input" rows="2" placeholder="https://app.example.com, https://office.example.com:*">{{ settings.allowed_origins | join(', ') if settings.allowed_origins else '' }}</textarea>
+                <div class="form-hint">Extra origins for DNS-rebinding protection. Public URL above is auto-added. Empty here + Public URL set = protection on with auto-derived list.</div>
+            </div>
+        </div>
+        <div class="settings-row">
             <div class="settings-label">Import Directories <span class="tooltip-icon" tabindex="0" data-tooltip="Filesystem paths AI tools can read for `source_file` parameter on configuration_import. Empty = file imports disabled. Anything inside is fair game; pick narrow paths.">&#x1F6C8;</span></div>
             <div>
                 <textarea name="allowed_import_dirs" class="form-input" rows="2" placeholder="/opt/zabbix/import, /tmp/imports">{{ settings.allowed_import_dirs | join(', ') if settings.allowed_import_dirs else '' }}</textarea>

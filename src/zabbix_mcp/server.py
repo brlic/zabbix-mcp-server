@@ -34,9 +34,22 @@ from typing import Annotated, Any, Optional
 
 from pydantic import Field
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.fastmcp.utilities import func_metadata as _fm_module
 from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
-from mcp.types import ToolAnnotations
+from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import (
+    CallToolResult,
+    CreateTaskResult,
+    Icon,
+    ListToolsRequest,
+    ListToolsResult,
+    ServerResult,
+    TextContent,
+    ToolAnnotations,
+    ToolExecution,
+)
 
 from zabbix_mcp.api import ALL_METHODS
 from zabbix_mcp.api.types import MethodDef, ParamDef
@@ -630,9 +643,17 @@ def _resolve_source_file(
     # Validate path is within an allowed directory (prevent path traversal)
     allowed = [Path(d).resolve() for d in allowed_import_dirs]
     if not any(path.is_relative_to(d) for d in allowed):
+        # Do NOT echo the allowed paths back to the LLM client - it
+        # leaks server filesystem layout to a token holder. The full
+        # list is in the operator's config + server logs already.
+        logger.warning(
+            "source_file rejected (outside allowed_import_dirs): %s; allowed=%s",
+            path, [str(d) for d in allowed],
+        )
         raise ValueError(
-            f"source_file must be within allowed import directories: "
-            f"{', '.join(str(d) for d in allowed)}"
+            "source_file is not under any allowed import directory "
+            "configured for this server. Ask the operator which paths "
+            "are permitted."
         )
 
     # Open with O_NOFOLLOW to reject symlinks atomically (no TOCTOU race)
@@ -840,10 +861,17 @@ def _build_zabbix_params(
             continue  # handled below
         if param_def.name in args:
             value = args[param_def.name]
-            # Split comma-separated output fields
-            if param_def.name == "output" and isinstance(value, str) and value != "extend":
+            # Normalise the ``output`` field for Zabbix's API:
+            # - ``"extend"`` / ``"count"`` stay as scalar strings
+            # - comma-separated string -> array of stripped names
+            # - any other single field name -> single-item array (Zabbix
+            #   7.4 rejects bare-string output on hostgroup/user/role/...
+            #   with ``Invalid parameter "/output": value must be "extend"``)
+            if param_def.name == "output" and isinstance(value, str) and value not in ("extend", "count"):
                 if "," in value:
                     value = [f.strip() for f in value.split(",")]
+                else:
+                    value = [value.strip()]
             # Split comma-separated sort fields
             if param_def.name == "sortfield" and isinstance(value, str) and "," in value:
                 value = [f.strip() for f in value.split(",")]
@@ -982,20 +1010,157 @@ _RAW_JSON_PARAM_DESC = (
 )
 
 
+# Tools that may run as task-augmented (MCP 2025-11-25 Tasks API).
+# Kept narrow on purpose - only ``report_generate`` typically takes
+# long enough (5-30 s, sometimes more for big host groups) to hit
+# Cloudflare / reverse-proxy timeouts. graph_render and capacity_forecast
+# are usually under 5 s and the polling overhead is not worth it.
+_TASK_AUGMENTED_TOOLS = frozenset({"report_generate"})
+
+
+def _patch_fastmcp_convert_result_for_tasks() -> None:
+    """Make FastMCP's result converter propagate ``CreateTaskResult``.
+
+    The 1.26 ``FuncMetadata.convert_result`` only special-cases
+    ``CallToolResult``; anything else (including the new
+    ``CreateTaskResult`` from Tasks API) gets shoved through
+    ``_convert_to_content`` and ends up as a stringified text block.
+    The low-level ``Server.call_tool`` decorator already understands
+    ``CreateTaskResult`` and passes it straight through (see
+    ``mcp/server/lowlevel/server.py`` around the ``isinstance(results,
+    CreateTaskResult)`` branch), so we only need to convince FastMCP
+    to leave it alone. Idempotent - safe to call multiple times.
+    """
+    if getattr(_fm_module.FuncMetadata.convert_result, "_zmcp_patched", False):
+        return
+    _orig_convert = _fm_module.FuncMetadata.convert_result
+
+    def _convert_with_tasks(self, result):  # type: ignore[no-untyped-def]
+        if isinstance(result, CreateTaskResult):
+            return result
+        return _orig_convert(self, result)
+
+    _convert_with_tasks._zmcp_patched = True  # type: ignore[attr-defined]
+    _fm_module.FuncMetadata.convert_result = _convert_with_tasks
+
+
+def _load_server_icons() -> list[Icon] | None:
+    """Build the ``icons`` list for ``Implementation`` from the bundled brand SVG.
+
+    MCP 2025-11-25 lets servers advertise icons that clients (Inspector,
+    Claude Desktop, ...) render next to the server name. We embed the
+    initMAX symbol SVG inline as a ``data:`` URI so the icon does not
+    depend on a reachable external URL or a separate static-file
+    endpoint - the few KB cost is paid once per ``initialize``.
+    """
+    import importlib.resources
+    try:
+        # Package-install layout: zabbix_mcp/admin/static/logo-symbol-color.svg
+        svg_bytes = (
+            importlib.resources.files("zabbix_mcp.admin")
+            .joinpath("static/logo-symbol-color.svg")
+            .read_bytes()
+        )
+    except (FileNotFoundError, ModuleNotFoundError, OSError):
+        return None
+    encoded = base64.b64encode(svg_bytes).decode("ascii")
+    return [Icon(src=f"data:image/svg+xml;base64,{encoded}", mimeType="image/svg+xml", sizes=["any"])]
+
+
+def _build_transport_security(config: AppConfig, host: str, port: int) -> TransportSecuritySettings | None:
+    """Compose ``TransportSecuritySettings`` for FastMCP from project config.
+
+    The MCP 2025-11-25 spec asks servers to validate the Origin header
+    against an allowlist (return HTTP 403 on mismatch). FastMCP can
+    enforce this via ``TransportSecuritySettings`` but defaults to off
+    for backwards compatibility when the bind host is not localhost.
+
+    We keep that BC in the no-config case (return None and let FastMCP
+    decide), but the moment the operator declares ``public_url`` or sets
+    ``allowed_hosts`` / ``allowed_origins`` explicitly, we flip
+    DNS-rebinding protection on. ``public_url`` alone is enough on its
+    own - we derive ``host:port`` for Host and ``scheme://host[:port]``
+    for Origin, which covers the typical reverse-proxy deployment.
+
+    Returns None when there is no config at all, in which case FastMCP
+    falls back to its localhost-only smart default when bound to
+    127.0.0.1 / ::1 / localhost, or leaves protection off when bound to
+    0.0.0.0. Callers should log a warning in the latter case.
+    """
+    explicit_hosts = list(config.server.allowed_hosts or [])
+    explicit_origins = list(config.server.allowed_origins or [])
+    public_url = (config.server.public_url or "").rstrip("/")
+
+    if not explicit_hosts and not explicit_origins and not public_url:
+        return None
+
+    derived_host = ""
+    derived_origin = ""
+    if public_url:
+        from urllib.parse import urlparse
+        parsed = urlparse(public_url)
+        if parsed.hostname:
+            derived_host = parsed.hostname if not parsed.port else f"{parsed.hostname}:{parsed.port}"
+            derived_origin = f"{parsed.scheme}://{derived_host}"
+
+    allowed_hosts = explicit_hosts.copy()
+    if derived_host and derived_host not in allowed_hosts:
+        allowed_hosts.append(derived_host)
+    # Keep localhost reachable for /health probes from the same box.
+    for h in (f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"):
+        if h not in allowed_hosts:
+            allowed_hosts.append(h)
+
+    allowed_origins = explicit_origins.copy()
+    if derived_origin and derived_origin not in allowed_origins:
+        allowed_origins.append(derived_origin)
+
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    )
+
+
 def _check_raw_json_allowed(raw_json: bool) -> str | None:
     """If *raw_json* is true, verify the current bearer token has the policy.
 
     Returns an operator-readable error string on rejection, or None when
     the request is allowed (raw_json=false, OR raw_json=true with the
-    policy granted, OR no token context at all - stdio mode).
+    policy granted on a real token).
+
+    Stdio mode (no bearer token, transport is a local subprocess - typical
+    Claude Desktop install) is treated as a *non-allowed* context: the
+    raw_json flag exists for programmatic non-LLM consumers, and a stdio
+    Claude Desktop session is the prime example of an LLM-facing client
+    that must keep the prompt-injection mitigation preamble. The
+    operator can opt in via the ``[server].stdio_allow_raw_json``
+    config flag if they really do drive the stdio process from a
+    non-LLM script.
     """
     if not raw_json:
         return None
     from zabbix_mcp.token_store import current_token_info
     tok = current_token_info.get()
     if tok is None:
-        # Pre-auth / stdio mode: no token policy to enforce.
-        return None
+        # Pre-auth / stdio mode. Allow only when the operator has
+        # explicitly opted in via the dedicated config flag - otherwise
+        # default to deny so a stdio LLM client cannot strip its own
+        # prompt-injection mitigation.
+        try:
+            from zabbix_mcp.config import get_config
+            cfg = get_config()
+            if getattr(cfg.server, "stdio_allow_raw_json", False):
+                return None
+        except Exception:
+            # If config is not yet loaded, fail closed.
+            pass
+        return (
+            "raw_json=true is not allowed in stdio mode. "
+            "Set 'stdio_allow_raw_json = true' under [server] in config.toml "
+            "if your stdio client is a non-LLM script. LLM clients "
+            "(Claude Desktop, ...) must keep the disclaimer preamble."
+        )
     if not getattr(tok, "allow_raw_json", False):
         logger.warning(
             "Token '%s' attempted raw_json=true without 'allow_raw_json' policy",
@@ -1012,6 +1177,39 @@ def _check_raw_json_allowed(raw_json: bool) -> str | None:
 def _format_result(data: str, raw_json: bool) -> str:
     """Return *data* with the untrusted-data preamble prepended, unless *raw_json* is true."""
     return data if raw_json else _UNTRUSTED_PREAMBLE + data
+
+
+def _raise_if_extension_error(result: str, *, raw_json: bool = False) -> str:
+    """Bridge extension-function error returns to the SEP-1303 isError shape,
+    and prepend the untrusted-data preamble to successful payloads.
+
+    Functions in ``api/extensions.py`` (graph_render, anomaly_detect,
+    capacity_forecast, item_threshold_search, ...) return their errors
+    as a small JSON object ``{"error": "..."}``. Pre-2025-11-25 that
+    landed as a successful tool result whose body happened to contain
+    error info; SEP-1303 asks for ``isError=true`` on the
+    ``CallToolResult`` instead. Re-raise as ``ToolError`` here, FastMCP
+    converts that into the right shape.
+
+    Successful payloads echo Zabbix-controlled strings (host names, item
+    names, descriptions). Apply the same untrusted-data preamble we
+    use on the standard tool path so the prompt-injection mitigation
+    is consistent across regular tools and extension tools.
+    """
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return _format_result(result, raw_json)
+    if isinstance(parsed, dict) and "error" in parsed and len(parsed) <= 2:
+        msg = parsed["error"]
+        # Error strings often quote Zabbix-supplied text (host name,
+        # item key, ...). FastMCP ships them verbatim to the LLM via
+        # the SEP-1303 isError envelope. Prepend the same untrusted-
+        # data marker so an attacker who controls a Zabbix description
+        # cannot craft an error message that reads as instructions.
+        msg_str = msg if isinstance(msg, str) else json.dumps(msg)
+        raise ToolError(_UNTRUSTED_PREAMBLE + msg_str)
+    return _format_result(result, raw_json)
 
 
 def _truncate_result(result: Any, *, max_chars: int = _RESPONSE_MAX_CHARS) -> str:
@@ -1113,11 +1311,36 @@ def _make_tool_handler(
         raw_json = bool(kwargs.pop("raw_json", False))
         _raw_err = _check_raw_json_allowed(raw_json)
         if _raw_err:
-            return json.dumps({"error": True, "message": _raw_err, "type": "PolicyError"})
+            # MCP 2025-11-25 (SEP-1303): tool-level errors surface as
+            # CallToolResult(isError=True), not JSON-RPC -32602. FastMCP
+            # converts any exception raised inside the handler into that
+            # shape; ToolError signals tool-level (vs. system) error.
+            raise ToolError(_raw_err)
+
+        # Per-call auth override: tools that operate on the caller's
+        # session (user.logout, user.checkAuthentication,
+        # userdirectory.test) accept an ``auth_sessionid`` parameter
+        # that the wrapper uses for the JSON-RPC ``auth`` field
+        # instead of the configured api_token. Lets the caller log in
+        # via user.login first, then exercise these tools without
+        # invalidating the long-lived MCP api_token.
+        # Only the three session-scoped methods are allowed to consume
+        # ``auth_sessionid``. Any other tool that receives the kwarg
+        # gets it silently dropped so a caller cannot reroute (say)
+        # ``host_get`` through the session-cookie path that bypasses
+        # the rate limiter / cached client.
+        _SESSION_AUTH_METHODS = {
+            "user.logout", "user.checkAuthentication", "userdirectory.test",
+        }
+        if method_def.api_method in _SESSION_AUTH_METHODS:
+            auth_sessionid = kwargs.pop("auth_sessionid", None)
+        else:
+            kwargs.pop("auth_sessionid", None)
+            auth_sessionid = None
 
         server_name = kwargs.get("server") or client_manager.default_server
         if not server_name:
-            return json.dumps({"error": True, "message": "No Zabbix server configured.", "type": "ConfigurationError"})
+            raise ToolError("No Zabbix server configured.")
 
         try:
             server_name = client_manager.resolve_server(server_name)
@@ -1127,7 +1350,7 @@ def _make_tool_handler(
             _tool_prefix = method_def.tool_name.rsplit("_", 1)[0] if "_" in method_def.tool_name else method_def.tool_name
             _auth_err = check_token_authorization(server_name, tool_prefix=_tool_prefix, is_write=not method_def.read_only)
             if _auth_err:
-                return json.dumps({"error": True, "message": _auth_err, "type": "AuthorizationError"})
+                raise ToolError(_auth_err)
 
             if not method_def.read_only:
                 client_manager.check_write(server_name)
@@ -1144,18 +1367,27 @@ def _make_tool_handler(
                 _resolve_valuemap_by_name,
                 params, method_def.api_method, client_manager, server_name,
             )
-            result = await asyncio.to_thread(
-                client_manager.call, server_name, method_def.api_method, params,
-            )
+            if auth_sessionid:
+                result = await asyncio.to_thread(
+                    client_manager.call_with_session,
+                    server_name, method_def.api_method, params, auth_sessionid,
+                )
+            else:
+                result = await asyncio.to_thread(
+                    client_manager.call, server_name, method_def.api_method, params,
+                )
             return _format_result(_truncate_result(result, max_chars=response_max_chars), raw_json)
 
-        except (ReadOnlyError, RateLimitError) as e:
-            return json.dumps({"error": True, "message": str(e), "type": type(e).__name__})
-        except ValueError as e:
-            return json.dumps({"error": True, "message": str(e), "type": type(e).__name__})
-        except Exception as e:
+        except ToolError:
+            # Already shaped for the LLM - let FastMCP mark isError=True.
+            raise
+        except (ReadOnlyError, RateLimitError, ValueError) as e:
+            raise ToolError(str(e))
+        except Exception:
             logger.exception("Error calling %s on server '%s'", method_def.api_method, server_name)
-            return json.dumps({"error": True, "message": f"API call failed for {method_def.api_method}. Check server logs for details.", "type": "APIError"})
+            raise ToolError(
+                f"API call failed for {method_def.api_method}. Check server logs for details."
+            )
 
     # Build a dynamic function signature so FastMCP generates proper JSON Schema
     sig_params: list[inspect.Parameter] = []
@@ -1304,11 +1536,11 @@ def _register_tools(
         by dedicated tools, or for advanced/undocumented API calls."""
         _raw_err = _check_raw_json_allowed(raw_json)
         if _raw_err:
-            return json.dumps({"error": True, "message": _raw_err, "type": "PolicyError"})
+            raise ToolError(_raw_err)
 
         server_name = server or client_manager.default_server
         if not server_name:
-            return json.dumps({"error": True, "message": "No Zabbix server configured.", "type": "ConfigurationError"})
+            raise ToolError("No Zabbix server configured.")
         try:
             server_name = client_manager.resolve_server(server_name)
 
@@ -1324,7 +1556,7 @@ def _register_tools(
             _prefix = method.split(".")[0].lower() if "." in method else ""
             _auth_err = check_token_authorization(server_name, tool_prefix=_prefix, is_write=not is_read_only)
             if _auth_err:
-                return json.dumps({"error": True, "message": _auth_err, "type": "AuthorizationError"})
+                raise ToolError(_auth_err)
 
             if not is_read_only:
                 client_manager.check_write(server_name)
@@ -1333,11 +1565,15 @@ def _register_tools(
                 client_manager.call, server_name, method, params or {},
             )
             return _format_result(_truncate_result(result, max_chars=response_max_chars), raw_json)
+        except ToolError:
+            raise
         except (ReadOnlyError, RateLimitError, ValueError) as e:
-            return json.dumps({"error": True, "message": str(e), "type": type(e).__name__})
-        except Exception as e:
+            raise ToolError(str(e))
+        except Exception:
             logger.exception("Error in raw API call '%s' on server '%s'", method, server_name)
-            return json.dumps({"error": True, "message": f"API call failed for {method}. Check server logs for details.", "type": "APIError"})
+            raise ToolError(
+                f"API call failed for {method}. Check server logs for details."
+            )
 
     if _ext_allowed("zabbix_raw_api_call"):
         mcp.add_tool(
@@ -1383,18 +1619,22 @@ def _register_tools(
         width: Annotated[Optional[int], Field(description="Image width in pixels, 100-4096 (default: 800)")] = 800,
         height: Annotated[Optional[int], Field(description="Image height in pixels, 50-2048 (default: 200)")] = 200,
         server: Annotated[Optional[str], Field(description=server_desc)] = None,
+        raw_json: Annotated[bool, Field(description=_RAW_JSON_PARAM_DESC)] = False,
     ) -> str:
         """Render a Zabbix graph as a PNG image. Returns a base64-encoded data URI
         that multimodal AI models can display and interpret directly. Use graph_get
         to find graph IDs first."""
+        _raw_err = _check_raw_json_allowed(bool(raw_json))
+        if _raw_err:
+            raise ToolError(_raw_err)
         srv = client_manager.resolve_server(server or client_manager.default_server)
         _auth_err = check_token_authorization(srv, tool_prefix="graph")
         if _auth_err:
-            return json.dumps({"error": True, "message": _auth_err, "type": "AuthorizationError"})
-        return await asyncio.to_thread(
+            raise ToolError(_auth_err)
+        return _raise_if_extension_error(await asyncio.to_thread(
             graph_render, client_manager, srv,
             graphid=graphid, period=period, width=width, height=height,
-        )
+        ), raw_json=bool(raw_json))
 
     if _ext_allowed("graph_render"):
         mcp.add_tool(
@@ -1411,19 +1651,23 @@ def _register_tools(
         period: Annotated[Optional[str], Field(description="Analysis period: '1d', '7d', '30d' (default: '7d')")] = "7d",
         threshold: Annotated[Optional[float], Field(description="Z-score threshold for anomaly (default: 2.0 = 2 standard deviations)")] = 2.0,
         server: Annotated[Optional[str], Field(description=server_desc)] = None,
+        raw_json: Annotated[bool, Field(description=_RAW_JSON_PARAM_DESC)] = False,
     ) -> str:
         """Detect anomalous hosts by comparing metric values across a host group.
         Uses z-score analysis on trend data to find hosts that deviate significantly
         from the group average. Requires at least 2 hosts with data."""
+        _raw_err = _check_raw_json_allowed(bool(raw_json))
+        if _raw_err:
+            raise ToolError(_raw_err)
         srv = client_manager.resolve_server(server or client_manager.default_server)
         _auth_err = check_token_authorization(srv, tool_prefix="host")
         if _auth_err:
-            return json.dumps({"error": True, "message": _auth_err, "type": "AuthorizationError"})
-        return await asyncio.to_thread(
+            raise ToolError(_auth_err)
+        return _raise_if_extension_error(await asyncio.to_thread(
             anomaly_detect, client_manager, srv,
             item_key=item_key, hostgroupid=hostgroupid, hostid=hostid,
             period=period, threshold=threshold,
-        )
+        ), raw_json=bool(raw_json))
 
     if _ext_allowed("anomaly_detect"):
         mcp.add_tool(
@@ -1439,18 +1683,22 @@ def _register_tools(
         threshold: Annotated[Optional[float], Field(description="Value threshold to predict when reached (default: 90.0)")] = 90.0,
         period: Annotated[Optional[str], Field(description="Historical period for regression: '7d', '30d', '90d' (default: '30d')")] = "30d",
         server: Annotated[Optional[str], Field(description=server_desc)] = None,
+        raw_json: Annotated[bool, Field(description=_RAW_JSON_PARAM_DESC)] = False,
     ) -> str:
         """Forecast when a metric will reach a threshold using linear regression
         on historical trend data. Returns predicted date, daily growth rate,
         and R-squared confidence. Useful for capacity planning (disk, CPU, memory)."""
+        _raw_err = _check_raw_json_allowed(bool(raw_json))
+        if _raw_err:
+            raise ToolError(_raw_err)
         srv = client_manager.resolve_server(server or client_manager.default_server)
         _auth_err = check_token_authorization(srv, tool_prefix="host")
         if _auth_err:
-            return json.dumps({"error": True, "message": _auth_err, "type": "AuthorizationError"})
-        return await asyncio.to_thread(
+            raise ToolError(_auth_err)
+        return _raise_if_extension_error(await asyncio.to_thread(
             capacity_forecast, client_manager, srv,
             hostid=hostid, item_key=item_key, threshold=threshold, period=period,
-        )
+        ), raw_json=bool(raw_json))
 
     if _ext_allowed("capacity_forecast"):
         mcp.add_tool(
@@ -1474,6 +1722,7 @@ def _register_tools(
         sort_desc: Annotated[Optional[bool], Field(description="Sort matched items by lastvalue descending — highest values first (default: true)")] = True,
         result_limit: Annotated[Optional[int], Field(description="Max number of matched items to return after threshold filtering")] = None,
         server: Annotated[Optional[str], Field(description=server_desc)] = None,
+        raw_json: Annotated[bool, Field(description=_RAW_JSON_PARAM_DESC)] = False,
     ) -> str:
         """Find items whose current lastvalue is above or below a numeric threshold.
 
@@ -1488,18 +1737,21 @@ def _register_tools(
 
         Returns {"scanned": N, "matched": M, "returned": R, "items": [...]} sorted by lastvalue.
         matched = total passing threshold; returned = items included (may be less if result_limit set)."""
+        _raw_err = _check_raw_json_allowed(bool(raw_json))
+        if _raw_err:
+            raise ToolError(_raw_err)
         srv = client_manager.resolve_server(server or client_manager.default_server)
         _auth_err = check_token_authorization(srv, tool_prefix="item")
         if _auth_err:
-            return json.dumps({"error": True, "message": _auth_err, "type": "AuthorizationError"})
-        return await asyncio.to_thread(
+            raise ToolError(_auth_err)
+        return _raise_if_extension_error(await asyncio.to_thread(
             item_threshold_search, client_manager, srv,
             lastvalue_gt=lastvalue_gt, lastvalue_ge=lastvalue_ge,
             lastvalue_lt=lastvalue_lt, lastvalue_le=lastvalue_le,
             search=search, filter=filter, hostids=hostids, groupids=groupids,
             output=output, extra_params=extra_params,
             sort_desc=sort_desc, result_limit=result_limit,
-        )
+        ), raw_json=bool(raw_json))
 
     if _ext_allowed("item_threshold_search"):
         mcp.add_tool(
@@ -1534,34 +1786,26 @@ def _register_tools(
             except Exception as _e:
                 logger.warning("Failed to load custom report templates: %s", _e)
 
-            async def _report_generate(
-                *,
-                report_type: Annotated[str, Field(description="Report type: 'availability', 'capacity_host', 'capacity_network', 'backup'")],
-                hostgroupid: Annotated[str, Field(description="Host group ID to include in the report")],
-                period: Annotated[Optional[str], Field(description="Report period: '7d', '30d', '90d' (default: '30d')")] = "30d",
-                company: Annotated[Optional[str], Field(description="Company name for report header (overrides config)")] = None,
-                server: Annotated[Optional[str], Field(description=server_desc)] = None,
+            async def _report_generate_work(
+                *, report_type: str, hostgroupid: str,
+                period: str | None, company: str | None, server: str | None,
             ) -> str:
-                """Generate a PDF report from Zabbix monitoring data. Returns the report
-                as a base64-encoded PDF data URI. Supported report types: availability
-                (SLA/uptime), capacity_host (CPU/memory/disk), capacity_network
-                (bandwidth/traffic), backup (daily success/fail matrix)."""
+                """Synchronous PDF generation - shared between sync and task-augmented paths."""
                 from zabbix_mcp.reporting import data_fetcher
                 srv = client_manager.resolve_server(server or client_manager.default_server)
                 _auth_err = check_token_authorization(srv, tool_prefix="host")
                 if _auth_err:
-                    return json.dumps({"error": True, "message": _auth_err, "type": "AuthorizationError"})
+                    raise ToolError(_auth_err)
 
                 valid_types = tuple(_REPORT_TEMPLATES.keys())
                 if report_type not in valid_types:
-                    return json.dumps({"error": f"Invalid report_type. Must be one of: {', '.join(valid_types)}"})
+                    raise ToolError(f"Invalid report_type. Must be one of: {', '.join(valid_types)}")
 
                 try:
-                    # Convert period string (e.g. "30d") to epoch timestamps
                     import re as _re
                     _period_match = _re.match(r"^(\d+)([dhm])$", period or "30d")
                     if not _period_match:
-                        return json.dumps({"error": "Invalid period format. Use e.g. '7d', '30d', '90d'."})
+                        raise ToolError("Invalid period format. Use e.g. '7d', '30d', '90d'.")
                     _amount, _unit = int(_period_match.group(1)), _period_match.group(2)
                     _delta = {"d": 86400, "h": 3600, "m": 60}[_unit] * _amount
                     _period_to = int(time.time())
@@ -1579,12 +1823,61 @@ def _register_tools(
                     return json.dumps({
                         "report": f"data:application/pdf;base64,{encoded}",
                         "report_type": report_type,
-                        "pages": len(pdf_bytes) // 3000 + 1,  # rough estimate
+                        "pages": len(pdf_bytes) // 3000 + 1,
                         "size_kb": round(len(pdf_bytes) / 1024, 1),
                     })
+                except ToolError:
+                    raise
                 except Exception as exc:
                     logger.exception("Report generation failed for type '%s'", report_type)
-                    return json.dumps({"error": f"Report generation failed: {exc}"})
+                    # Do NOT echo the raw exception - WeasyPrint /
+                    # Jinja2 messages can include absolute filesystem
+                    # paths and template line numbers, which leaks
+                    # server layout to the LLM client. Generic
+                    # message + exc_info already in the log.
+                    raise ToolError("Report generation failed - see server logs.")
+
+            async def _report_generate(
+                *,
+                report_type: Annotated[str, Field(description="Report type: 'availability', 'capacity_host', 'capacity_network', 'backup'")],
+                hostgroupid: Annotated[str, Field(description="Host group ID to include in the report")],
+                period: Annotated[Optional[str], Field(description="Report period: '7d', '30d', '90d' (default: '30d')")] = "30d",
+                company: Annotated[Optional[str], Field(description="Company name for report header (overrides config)")] = None,
+                server: Annotated[Optional[str], Field(description=server_desc)] = None,
+            ):
+                """Generate a PDF report from Zabbix monitoring data. Returns the report
+                as a base64-encoded PDF data URI. Supported report types: availability
+                (SLA/uptime), capacity_host (CPU/memory/disk), capacity_network
+                (bandwidth/traffic), backup (daily success/fail matrix).
+
+                Long-running (5-30 s typically). Clients that support MCP 2025-11-25
+                Tasks API may invoke this with `task: {ttl: 60000}` to receive a
+                CreateTaskResult and poll `tasks/get` instead of holding a single
+                long HTTP request - useful when fronted by a proxy with short timeouts."""
+                # Detect task-augmented invocation. ctx.experimental.is_task is True
+                # when the client included `task: {...}` in the request params.
+                try:
+                    ctx = mcp._mcp_server.request_context  # type: ignore[attr-defined]
+                    exp = getattr(ctx, "experimental", None)
+                except LookupError:
+                    exp = None
+
+                if exp is not None and exp.is_task:
+                    async def _work(task_ctx) -> CallToolResult:
+                        text = await _report_generate_work(
+                            report_type=report_type, hostgroupid=hostgroupid,
+                            period=period, company=company, server=server,
+                        )
+                        return CallToolResult(
+                            content=[TextContent(type="text", text=text)],
+                            isError=False,
+                        )
+                    return await exp.run_task(_work)
+
+                return await _report_generate_work(
+                    report_type=report_type, hostgroupid=hostgroupid,
+                    period=period, company=company, server=server,
+                )
 
             if _ext_allowed("report_generate"):
                 mcp.add_tool(
@@ -1625,12 +1918,12 @@ def _register_tools(
         _prefix = action.split(".")[0].lower() if "." in action else ""
         _auth_err = check_token_authorization(srv, tool_prefix=_prefix, is_write=True)
         if _auth_err:
-            return json.dumps({"error": True, "message": _auth_err, "type": "AuthorizationError"})
+            raise ToolError(_auth_err)
 
         try:
             client_manager.check_write(srv)
         except ReadOnlyError as e:
-            return json.dumps({"error": str(e)})
+            raise ToolError(str(e))
 
         # Generate secure token
         token = secrets.token_urlsafe(32)
@@ -1659,12 +1952,26 @@ def _register_tools(
                 "caller_token_id": _caller_id,
             }
 
+        # Redact any field whose name suggests it carries a credential.
+        # The previous list was just ``password`` which left api_token,
+        # bind_password, tls_psk_identity / tls_psk, webhook tokens,
+        # private_key, secret, and similar Zabbix-side credential
+        # fields visible to the LLM.
+        _SECRET_NAME_FRAGMENTS = (
+            "password", "passwd", "secret", "token", "api_token",
+            "private_key", "psk", "credential", "auth", "bearer",
+        )
+        def _redact(k: str, v: Any) -> Any:
+            kl = k.lower()
+            if any(frag in kl for frag in _SECRET_NAME_FRAGMENTS):
+                return "***REDACTED***"
+            return v
         return json.dumps({
             "status": "pending_confirmation",
             "confirmation_token": token,
             "action": action,
             "server": srv,
-            "params_preview": {k: v for k, v in params.items() if k != "password"},
+            "params_preview": {k: _redact(k, v) for k, v in params.items()},
             "expires_in_seconds": 300,
             "message": "Review the action above. Call action_confirm with the token to execute.",
         }, indent=2)
@@ -1688,17 +1995,17 @@ def _register_tools(
         with _pending_actions_lock:
             action_data = _pending_actions.pop(confirmation_token, None)
         if action_data is None:
-            return json.dumps({"error": "Invalid or expired confirmation token."})
+            raise ToolError("Invalid or expired confirmation token.")
 
         # Verify caller identity matches the preparer
         from zabbix_mcp.token_store import current_token_info as _cti
         _caller_token = _cti.get()
         _caller_id = _caller_token.id if _caller_token else None
         if action_data.get("caller_token_id") != _caller_id:
-            return json.dumps({"error": "Confirmation token was prepared by a different caller. Access denied."})
+            raise ToolError("Confirmation token was prepared by a different caller. Access denied.")
 
         if action_data["expires"] < time.time():
-            return json.dumps({"error": "Confirmation token has expired. Prepare the action again."})
+            raise ToolError("Confirmation token has expired. Prepare the action again.")
 
         try:
             result = await asyncio.to_thread(
@@ -1711,9 +2018,11 @@ def _register_tools(
                 "server": action_data["server"],
                 "result": result,
             })
+        except ToolError:
+            raise
         except Exception as exc:
             logger.exception("Action execution failed: %s", action_data["action"])
-            return json.dumps({"error": f"Execution failed: {exc}", "action": action_data["action"]})
+            raise ToolError(f"Execution failed: {exc} (action: {action_data['action']})")
 
     if _ext_allowed("action_confirm"):
         mcp.add_tool(
@@ -2015,6 +2324,26 @@ def run_server(
         logger.info("MCP endpoint: %s/mcp", base_url)
         logger.info("Health check: %s/health", base_url)
 
+    transport_security = _build_transport_security(config, host, port)
+    if transport_security is not None:
+        logger.info(
+            "DNS rebinding protection ENABLED. Allowed Host headers: %s. Allowed Origin headers: %s.",
+            transport_security.allowed_hosts or "(none)",
+            transport_security.allowed_origins or "(none)",
+        )
+    elif host not in ("127.0.0.1", "localhost", "::1") and transport != "stdio":
+        logger.warning(
+            "DNS rebinding protection is OFF (host='%s', no public_url / allowed_hosts / allowed_origins set). "
+            "MCP 2025-11-25 spec recommends Origin/Host validation. Set [server].public_url or "
+            "[server].allowed_origins in config.toml to enable.",
+            host,
+        )
+
+    # Allow CreateTaskResult to escape FastMCP's result converter unchanged
+    # so the task-augmented path on report_generate actually reaches the
+    # low-level Server which knows how to ship it to the client. Idempotent.
+    _patch_fastmcp_convert_result_for_tasks()
+
     mcp = FastMCP(
         name="zabbix-mcp-server",
         host=host,
@@ -2026,8 +2355,43 @@ def run_server(
             "and 'limit' parameters. Write operations (create/update/delete) are only "
             "allowed on servers not configured as read_only."
         ),
+        website_url="https://github.com/initMAX/zabbix-mcp-server",
+        icons=_load_server_icons(),
+        transport_security=transport_security,
         **auth_kwargs,
     )
+
+    # Enable experimental Tasks API (MCP 2025-11-25) with our bounded
+    # in-memory store. Auto-registers tasks/get, tasks/result,
+    # tasks/list, tasks/cancel handlers on the low-level server. The
+    # store ceiling protects against a misbehaved client filling RAM
+    # with stale PDF payloads; the periodic sweeper is started below.
+    from zabbix_mcp.task_store import BoundedInMemoryTaskStore
+    _task_store = BoundedInMemoryTaskStore()
+    mcp._mcp_server.experimental.enable_tasks(store=_task_store)
+    object.__setattr__(config, "_task_store", _task_store)
+    logger.info(
+        "Experimental Tasks API enabled (default TTL %ds, ceiling %dh, max %d live tasks)",
+        _task_store._default_ttl_ms // 1000,
+        _task_store._max_ttl_ms // 3_600_000,
+        _task_store._max_live_tasks,
+    )
+
+    # Override list_tools so report_generate advertises taskSupport=optional.
+    # FastMCP's own list_tools does not expose the execution field, so we
+    # decorate the low-level Server with a wrapper that calls FastMCP's
+    # list_tools and patches the relevant entries on the way out.
+    _orig_list_tools_handler = mcp._mcp_server.request_handlers.get(ListToolsRequest)
+
+    async def _list_tools_with_execution(req):
+        result = await _orig_list_tools_handler(req)
+        tools_list = result.root.tools
+        for tool in tools_list:
+            if tool.name in _TASK_AUGMENTED_TOOLS:
+                tool.execution = ToolExecution(taskSupport="optional")
+        return ServerResult(ListToolsResult(tools=tools_list))
+
+    mcp._mcp_server.request_handlers[ListToolsRequest] = _list_tools_with_execution
 
     tool_count = _register_tools(
         mcp, client_manager, config.server.tools, config.server.disabled_tools,
@@ -2107,6 +2471,31 @@ def run_server(
                 asgi_app = mcp.streamable_http_app()
             else:
                 asgi_app = mcp.sse_app()
+
+            # Spawn the periodic task-store cleanup as a background task
+            # tied to Starlette lifespan. Ensures expired tasks (and their
+            # PDF payloads) get pruned even during a quiet period that
+            # would not trigger lazy cleanup on access. Done by wrapping
+            # the original lifespan context manager (Starlette 1.0+ no
+            # longer exposes the legacy on_startup / on_shutdown lists).
+            from contextlib import asynccontextmanager
+            from zabbix_mcp.task_store import run_periodic_cleanup as _run_cleanup
+            _orig_lifespan_ctx = asgi_app.router.lifespan_context
+
+            @asynccontextmanager
+            async def _lifespan_with_cleanup(app):
+                async with _orig_lifespan_ctx(app) as state:
+                    cleanup_task = asyncio.create_task(_run_cleanup(_task_store))
+                    try:
+                        yield state
+                    finally:
+                        cleanup_task.cancel()
+                        try:
+                            await cleanup_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+
+            asgi_app.router.lifespan_context = _lifespan_with_cleanup
 
             # Capture client IP in context var for token IP allowlist checks.
             # When behind a reverse proxy listed in [server].trusted_proxies,

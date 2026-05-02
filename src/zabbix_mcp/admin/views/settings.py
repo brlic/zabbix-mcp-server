@@ -24,7 +24,7 @@ logger = logging.getLogger("zabbix_mcp.admin")
 RESTART_REQUIRED = {"host", "port", "transport", "tls_cert_file", "tls_key_file", "log_file"}
 
 # List fields — split comma-separated into TOML arrays
-LIST_KEYS = {"cors_origins", "allowed_hosts", "allowed_import_dirs", "tools", "disabled_tools"}
+LIST_KEYS = {"cors_origins", "allowed_hosts", "allowed_origins", "allowed_import_dirs", "tools", "disabled_tools"}
 
 # Boolean fields — checkbox present = True, absent = False
 BOOL_KEYS = {"compact_output", "enabled", "update_check_enabled"}
@@ -38,7 +38,7 @@ SECTION_CONFIG = {
     },
     "tls_access": {
         "toml_section": "server",
-        "allowed_keys": {"tls_cert_file", "tls_key_file", "cors_origins", "allowed_hosts", "allowed_import_dirs", "rate_limit"},
+        "allowed_keys": {"tls_cert_file", "tls_key_file", "cors_origins", "allowed_hosts", "allowed_origins", "allowed_import_dirs", "rate_limit"},
         "min_role": "admin",
     },
     "tools": {
@@ -131,6 +131,28 @@ def _validate_list_entry(key: str, entry: str) -> str | None:
             return f"CORS origin '{entry}' must not include a path - drop everything after the host[:port]."
         if parts.query or parts.fragment:
             return f"CORS origin '{entry}' must not include query / fragment - just scheme://host[:port]."
+        return None
+    if key == "allowed_origins":
+        # MCP 2025-11-25 DNS-rebinding allowlist. Same shape as cors_origins
+        # except FastMCP's TransportSecurityMiddleware ALSO accepts the
+        # ``host:*`` port-wildcard suffix (e.g. ``https://app.example.com:*``)
+        # to cover varying client ports without listing each one.
+        if not entry.startswith(("http://", "https://")):
+            return f"Origin '{entry}' must start with http:// or https://"
+        from urllib.parse import urlsplit
+        # Strip optional ``:*`` port-wildcard before URL parsing - urlsplit
+        # rejects '*' as a port. The wildcard is FastMCP-internal syntax.
+        probe = entry[:-2] if entry.endswith(":*") else entry
+        try:
+            parts = urlsplit(probe)
+        except ValueError:
+            return f"Origin '{entry}' is not a valid URL."
+        if not parts.hostname:
+            return f"Origin '{entry}' is missing a host."
+        if parts.path not in ("", "/"):
+            return f"Origin '{entry}' must not include a path - drop everything after the host[:port]."
+        if parts.query or parts.fragment:
+            return f"Origin '{entry}' must not include query / fragment - just scheme://host[:port]."
         return None
     if key == "allowed_import_dirs":
         # Filesystem path. Reject null bytes (Linux abuse) and

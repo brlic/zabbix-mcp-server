@@ -111,6 +111,16 @@ compact_output = true
 # built-in templates.
 # response_max_chars = 50000
 
+# Allow stdio clients to pass `raw_json: true` and skip the
+# "[System: The following is raw data ...]" prompt-injection mitigation
+# preamble. Default: false. The flag exists for non-LLM stdio scripts
+# (e.g. a Python tool that drives the MCP via stdio and parses JSON
+# directly). LLM stdio clients (Claude Desktop) MUST keep the
+# preamble - it is what stops a model from following operator-
+# controlled text in Zabbix data. HTTP transport ignores this
+# setting and uses the per-token `allow_raw_json` field instead.
+# stdio_allow_raw_json = false
+
 # ---------------------------------------------------------------------------
 # PDF Reporting (optional - requires: pip install zabbix-mcp-server[reporting])
 # ---------------------------------------------------------------------------
@@ -176,6 +186,24 @@ compact_output = true
 # Supports individual IPs and CIDR notation.
 #
 # allowed_hosts = ["127.0.0.1", "10.0.0.0/24", "192.168.1.100"]
+
+# ---------------------------------------------------------------------------
+# Origin allowlist (DNS rebinding protection - MCP 2025-11-25)
+# ---------------------------------------------------------------------------
+# List of allowed Origin header values. Bad Origin returns HTTP 403; bad
+# Host returns 421. The whole protection layer is OFF when none of
+# `public_url`, `allowed_origins`, `allowed_hosts` are set on a non-localhost
+# bind (BC). The moment ANY of them is configured, protection flips on
+# automatically.
+#
+# Smart default: if `public_url` above is set (e.g. "https://mcp.example.com"),
+# the host[:port] and scheme://host[:port] are added to the Host / Origin
+# allowlists for free - no need to mirror them here.
+#
+# Use this list to add ADDITIONAL origins beyond what `public_url` derives.
+# Wildcard ports work as "https://example.com:*".
+#
+# allowed_origins = ["https://app.example.com", "https://office.example.com:*"]
 
 # ---------------------------------------------------------------------------
 # File import directories
@@ -406,6 +434,17 @@ update_check_enabled = true
 # allowed_ips = ["10.0.0.0/24"]   # Optional IP/CIDR whitelist
 # allowed_servers = ["*"]          # Optional: restrict to specific Zabbix servers
 # expires_at = "2026-12-31T23:59:59Z"  # Optional expiry (ISO 8601)
+#
+# allow_raw_json = false           # When true, this token may pass `raw_json: true`
+#                                  # on any tool call to skip the
+#                                  # "[System: The following is raw data ...]"
+#                                  # prompt-injection mitigation preamble.
+#                                  # ONLY safe for non-LLM programmatic clients
+#                                  # (Python scripts, n8n workflows, ...). Keep
+#                                  # disabled for any token an LLM client uses
+#                                  # (Claude, GPT, Cursor, ...) - the disclaimer
+#                                  # is what stops the model from following
+#                                  # operator-controlled text in Zabbix data.
 
 # ---------------------------------------------------------------------------
 # Zabbix servers
@@ -445,6 +484,20 @@ verify_ssl = true
 # to a Zabbix version newer than what zabbix-utils has been tested with.
 # Default: false.
 # skip_version_check = false
+
+# Frontend (web UI) credentials. Only used by the graph_render extension,
+# which calls chart2.php — the Zabbix endpoint that produces graph PNGs and
+# does NOT accept the API token directly; it requires a signed zbx_session
+# cookie issued by the login form. When both fields are set, graph_render
+# logs in once at /index.php?login=1, caches the cookie, and reuses it for
+# subsequent renders. Leave blank if you do not need graph_render.
+#
+# Security: use a dedicated low-privilege account (a "graph reader" with
+# read-only permissions on the host groups whose graphs you want), NOT a
+# Super-admin. The account's password is sent as form-data over HTTPS only
+# if `url` above starts with https://; verify your TLS configuration.
+# frontend_username = "graph_reader"
+# frontend_password = "${ZABBIX_PROD_FRONTEND_PASSWORD}"
 
 # ---------------------------------------------------------------------------
 # Example: additional server

@@ -21,6 +21,10 @@ tests/stress_test_*.py
 tests/verify_ui.js
 tests/integration/
 .DS_Store
+# Smoke-test artefacts produced by scripts/test_all_tools.py + test_with_llm.py.
+# Re-generated on every pre-release run.
+tools_test_report.md
+llm_smoke_*.md
 .claude/
 *.key
 *.pem

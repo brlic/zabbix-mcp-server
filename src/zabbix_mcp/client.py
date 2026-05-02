@@ -225,6 +225,77 @@ class ClientManager:
             raise ValueError("No Zabbix servers configured")
         return default
 
+    def call_with_session(self, server: str, method: str, params: Any, sessionid: str) -> Any:
+        """Execute a Zabbix API call authenticated with an arbitrary session id.
+
+        The standard ``call()`` path always uses the configured
+        ``api_token`` for ``[zabbix.<name>]`` - which works for every
+        regular tool. ``user.logout`` / ``user.checkAuthentication``
+        / ``userdirectory.test`` are special: they verify or
+        invalidate the session belonging to the CALLER. Using the
+        configured api_token on those would either invalidate that
+        token (logout) or always fail (checkAuthentication looks up
+        the ``sessions`` table which has no row for an api_token).
+
+        This helper bypasses the cached ``zabbix_utils.ZabbixAPI``
+        client and posts a raw JSON-RPC request to ``api_jsonrpc.php``
+        with the supplied ``sessionid`` in the ``auth`` field. Used
+        only by tools that explicitly opt in via an ``auth_sessionid``
+        argument from the caller (typically the value returned by a
+        prior ``user.login`` call).
+        """
+        import json as _json
+        import ssl as _ssl
+        import urllib.request as _urllib_request
+        srv = self.get_server_config(server)
+        url = srv.url.rstrip("/") + "/api_jsonrpc.php"
+        # Zabbix 6.4+ moved auth out of the body and onto the
+        # ``Authorization: Bearer`` header. Older Zabbix versions
+        # accept either; the header path works on every supported
+        # version so use it unconditionally.
+        # ``user.checkAuthentication`` validates a session id passed in
+        # the body as ``sessionid``. The MCP wrapper exposes this via
+        # the ``auth_sessionid`` arg for ergonomic reasons (one place
+        # to put the session id), so when the caller omits the body
+        # ``sessionid`` we copy ``auth_sessionid`` into it. Otherwise
+        # the call would fail with "missing parameter sessionid".
+        if method == "user.checkAuthentication":
+            params = dict(params or {})
+            params.setdefault("sessionid", sessionid)
+        body = _json.dumps({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": 1,
+        }).encode("utf-8")
+        ctx = _ssl.create_default_context()
+        if not srv.verify_ssl:
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+        # ``user.checkAuthentication`` is the one method Zabbix REJECTS
+        # when called WITH an Authorization header ("must be called
+        # without authorization header"). The session id goes only
+        # into the body params for that method; for everything else
+        # we still forward it as a Bearer header.
+        headers = {"Content-Type": "application/json-rpc"}
+        if method != "user.checkAuthentication":
+            headers["Authorization"] = f"Bearer {sessionid}"
+        req = _urllib_request.Request(url, data=body, headers=headers)
+        with _urllib_request.urlopen(req, timeout=srv.request_timeout, context=ctx) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        if "error" in data:
+            err = data["error"]
+            from zabbix_utils.exceptions import APIRequestError
+            # zabbix_utils ``APIRequestError.__init__`` reaches into a
+            # nested ``body`` field for masking; satisfy that contract.
+            raise APIRequestError({
+                "code": err.get("code"),
+                "message": err.get("message", ""),
+                "data": err.get("data", ""),
+                "body": {"method": method, "params": params},
+            })
+        return data.get("result")
+
     def call(self, server: str, method: str, params: Any) -> Any:
         """Execute a Zabbix API call with rate limiting and auto-reconnect.
 

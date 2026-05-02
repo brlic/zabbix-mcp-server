@@ -717,6 +717,55 @@ items = json.loads(result)
 
 **Important:** never enable `allow_raw_json` on a token used by an LLM client (Claude, GPT, Cursor, ...). The disclaimer is the LLM's defense-in-depth marker for prompt-injection attempts hidden in Zabbix data; without it, a hostile hostname or problem description has a higher chance of being interpreted as instructions.
 
+#### Tasks API for long-running tools
+
+When fronted by Cloudflare or a reverse proxy with a typical 30 s read timeout, synchronous PDF generation on bigger host groups can fail mid-flight. The `report_generate` tool advertises `execution.taskSupport: "optional"` (per MCP 2025-11-25 spec), so MCP clients can opt into asynchronous execution: instead of holding a single long HTTP request, the client receives a task id, polls until the task completes, then pulls the final payload.
+
+Other tools stay synchronous (under 5 s typically) - the polling overhead is not worth it.
+
+```python
+# Async PDF generation via Tasks API. Requires a client that advertises
+# tasks support in initialize() - the official `mcp` Python SDK does.
+import asyncio, base64
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+from mcp.types import GetTaskPayloadRequest, GetTaskPayloadRequestParams, GetTaskPayloadResult
+
+async def render_report(headers, hostgroupid, period="30d"):
+    async with streamablehttp_client("https://mcp.example.com/mcp", headers=headers) as (r, w, _):
+        async with ClientSession(r, w) as s:
+            await s.initialize()
+
+            # `task: {ttl: 60000}` switches the call from sync to task-augmented.
+            # Server returns a CreateTaskResult immediately; the work runs in
+            # the background and the client polls for status.
+            create = await s.send_request(...)  # tools/call with task field
+            task_id = create.task.taskId
+
+            # Poll status. Server suggests `pollInterval`; respect it.
+            while True:
+                status = (await s.experimental.get_task(task_id)).status
+                if status in ("completed", "failed", "cancelled"):
+                    break
+                await asyncio.sleep(3)
+
+            if status != "completed":
+                raise RuntimeError(f"Report failed: {status}")
+
+            # Pull the final payload (same shape as the sync return value).
+            payload = await s.experimental.get_task_result(task_id, GetTaskPayloadResult)
+            return payload  # contains base64-encoded PDF data URI
+```
+
+Server-side limits on the in-memory task store:
+
+- **Default TTL** when the client omits `ttl`: 1 hour
+- **TTL ceiling** (max client-supplied): 24 hours
+- **Soft cap** of 100 live tasks per server instance - past this, `create_task` returns a clear retryable error
+- **Periodic cleanup** sweeps expired tasks every 5 minutes (no background memory growth during quiet periods)
+
+Ordinary clients (LLM clients, Inspector, anything that does not pass `task` on the call) keep getting the synchronous response unchanged - no behaviour change for them.
+
 ## Example Prompts
 
 Once connected, you can ask your AI assistant things like:

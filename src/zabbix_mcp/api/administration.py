@@ -44,7 +44,7 @@ This module covers the "Administration" domain of the Zabbix API:
 """
 
 from zabbix_mcp.api.types import MethodDef, ParamDef
-from zabbix_mcp.api.common import COMMON_GET_PARAMS, CREATE_PARAMS, UPDATE_PARAMS, DELETE_PARAMS
+from zabbix_mcp.api.common import COMMON_GET_PARAMS, SINGLETON_GET_PARAMS, CREATE_PARAMS, UPDATE_PARAMS, DELETE_PARAMS
 
 # ---------------------------------------------------------------------------
 # autoregistration
@@ -61,7 +61,7 @@ _AUTOREGISTRATION_METHODS: list[MethodDef] = [
             "singleton object with no filtering options."
         ),
         read_only=True,
-        params=COMMON_GET_PARAMS,
+        params=SINGLETON_GET_PARAMS,
     ),
     MethodDef(
         api_method="autoregistration.update",
@@ -218,7 +218,7 @@ _SETTINGS_METHODS: list[MethodDef] = [
             "other global defaults. No filtering options -- returns the full object."
         ),
         read_only=True,
-        params=COMMON_GET_PARAMS,
+        params=SINGLETON_GET_PARAMS,
     ),
     MethodDef(
         api_method="settings.update",
@@ -484,7 +484,7 @@ _HOUSEKEEPING_METHODS: list[MethodDef] = [
             "interval, and audit log retention. This is a singleton object."
         ),
         read_only=True,
-        params=COMMON_GET_PARAMS,
+        params=SINGLETON_GET_PARAMS,
     ),
     MethodDef(
         api_method="housekeeping.update",

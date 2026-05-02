@@ -633,10 +633,23 @@ _TASK_GET = MethodDef(
     ),
     read_only=True,
     compact_fields=("taskid", "type", "status"),
-    params=COMMON_GET_PARAMS + [
+    # task.get does not accept search/filter/limit/sortfield - it filters
+    # only by ``taskids`` / ``proxyids``. Sending the COMMON_GET_PARAMS
+    # surface returns ``Invalid parameter "/": unexpected parameter
+    # "limit"`` from Zabbix 6.0+.
+    params=[
+        ParamDef("output", "str", "Fields to return ('extend' for all)."),
         ParamDef(
             "taskids", "list[str]",
             "Return only tasks with the given IDs.",
+        ),
+        ParamDef(
+            "proxyids", "list[str]",
+            "Return only tasks created on the given proxies.",
+        ),
+        ParamDef(
+            "extra_params", "dict",
+            "Additional API parameters not covered above (e.g. ``preservekeys``).",
         ),
     ],
 )
