@@ -23,27 +23,33 @@ services:
     # MCP_PORT  - port used inside the container and exposed on the Docker host (default: 8080)
     # Set these in .env to override without editing this file.
     command: ["--config", "/etc/zabbix-mcp/config.toml", "--host", "0.0.0.0", "--port", "${MCP_PORT:-8080}"]
-    ports:
-      - "${MCP_HOST:-127.0.0.1}:${MCP_PORT:-8080}:${MCP_PORT:-8080}"
-      - "${MCP_HOST:-127.0.0.1}:${ADMIN_PORT:-9090}:${ADMIN_PORT:-9090}"
-    env_file:
-      - path: .env
-        required: false
+    #ports:
+    #  - "${MCP_HOST:-127.0.0.1}:${MCP_PORT:-8080}:${MCP_PORT:-8080}"
+    #  - "${MCP_HOST:-127.0.0.1}:${ADMIN_PORT:-9090}:${ADMIN_PORT:-9090}"
     environment:
-      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:-}
-      - ADMIN_PORT=${ADMIN_PORT:-9090}
+      ZABBIX_API_TOKEN: "${ZABBIX_API_TOKEN}"
+      MCP_AUTH_TOKEN: "${MCP_AUTH_TOKEN}"
+      ADMIN_PORT: "9090"
     volumes:
-      - ./config.toml:/etc/zabbix-mcp/config.toml
+      - ./config.toml:/etc/zabbix-mcp/config.toml:rw
       - assets:/etc/zabbix-mcp/assets
       - tls:/etc/zabbix-mcp/tls
       - templates:/etc/zabbix-mcp/templates
       - logs:/var/log/zabbix-mcp
     healthcheck:
-      test: ["CMD", "/opt/zabbix-mcp/venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${MCP_PORT:-8080}/health')"]
+      test: ["CMD", "/opt/zabbix-mcp/venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
+    networks:
+      rede1:
+        ipv4_address: 172.22.0.60
+
+networks:
+  rede1:
+    external: true
+    name: rede_servicos_internos_brlic
 
 volumes:
   assets:
