@@ -30,11 +30,13 @@ services:
       MCP_AUTH_TOKEN: "${MCP_AUTH_TOKEN}"
       ADMIN_PORT: "9090"
     volumes:
-      - ./config.toml:/etc/zabbix-mcp/config.toml:rw
-      - assets:/etc/zabbix-mcp/assets
-      - tls:/etc/zabbix-mcp/tls
-      - templates:/etc/zabbix-mcp/templates
+      #- ./config.toml:/etc/zabbix-mcp/config.toml:rw
+      #- assets:/etc/zabbix-mcp/assets
+      #- tls:/etc/zabbix-mcp/tls
+      #- templates:/etc/zabbix-mcp/templates
+      - zabbix-mcp:/var/log/zabbix-mcp
       - logs:/var/log/zabbix-mcp
+
     healthcheck:
       test: ["CMD", "/opt/zabbix-mcp/venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
       interval: 30s
@@ -51,7 +53,8 @@ networks:
     name: rede_servicos_internos_brlic
 
 volumes:
-  assets:
-  tls:
-  templates:
+  #assets:
+  #tls:
+  #templates:
+  zabbix-mcp:
   logs:
