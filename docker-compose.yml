@@ -34,7 +34,7 @@ services:
       #- assets:/etc/zabbix-mcp/assets
       #- tls:/etc/zabbix-mcp/tls
       #- templates:/etc/zabbix-mcp/templates
-      - zabbix-mcp:/var/log/zabbix-mcp
+      - zabbix-mcp:/etc/zabbix-mcp
       - logs:/var/log/zabbix-mcp
 
     healthcheck:
